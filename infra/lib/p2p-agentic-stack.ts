@@ -1,6 +1,7 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: MIT-0
 import * as cdk from "aws-cdk-lib";
+import * as cloudwatch from "aws-cdk-lib/aws-cloudwatch";
 import * as ec2 from "aws-cdk-lib/aws-ec2";
 import * as cognito from "aws-cdk-lib/aws-cognito";
 import * as dynamodb from "aws-cdk-lib/aws-dynamodb";
@@ -20,6 +21,7 @@ import * as apigwv2_authorizers from "aws-cdk-lib/aws-apigatewayv2-authorizers";
 import * as events from "aws-cdk-lib/aws-events";
 import * as targets from "aws-cdk-lib/aws-events-targets";
 import * as sns from "aws-cdk-lib/aws-sns";
+import * as cloudwatchActions from "aws-cdk-lib/aws-cloudwatch-actions";
 import * as wafv2 from "aws-cdk-lib/aws-wafv2";
 import * as route53 from "aws-cdk-lib/aws-route53";
 import * as route53Targets from "aws-cdk-lib/aws-route53-targets";
@@ -172,6 +174,16 @@ export class P2PAgenticStack extends cdk.Stack {
       partitionKey: { name: "document_id", type: dynamodb.AttributeType.STRING },
       billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
       removalPolicy: cdk.RemovalPolicy.DESTROY,
+    });
+
+    const workflowCheckpointTable = new dynamodb.Table(this, "WorkflowCheckpoints", {
+      tableName: `${prefix}-workflow-checkpoints`,
+      partitionKey: { name: "PK", type: dynamodb.AttributeType.STRING },
+      sortKey: { name: "SK", type: dynamodb.AttributeType.STRING },
+      billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
+      encryption: dynamodb.TableEncryption.AWS_MANAGED,
+      pointInTimeRecoverySpecification: { pointInTimeRecoveryEnabled: true },
+      removalPolicy: cdk.RemovalPolicy.RETAIN,
     });
 
     // =====================================================================
@@ -443,6 +455,13 @@ export class P2PAgenticStack extends cdk.Stack {
           ERPNEXT_SECRET_ARN: erpnextSecret.secretArn,
           ERPNEXT_URL: props.erpnextUrl,
           GATEWAY_ENDPOINT: `https://${gateway.gatewayId}.gateway.bedrock-agentcore.${cdk.Stack.of(this).region}.amazonaws.com/mcp`,
+          ...(name === "workflow" ? {
+            P2P_CHECKPOINT_TABLE: workflowCheckpointTable.tableName,
+            P2P_EMF_LOGS: "1",
+            AWS_GENAI_CONTENT_EXTRACTION_OPT_OUT: "true",
+            OTEL_SEMCONV_STABILITY_OPT_IN: "gen_ai_unredacted_attributes=",
+            OTEL_SERVICE_NAME: `${prefix}-workflow`,
+          } : {}),
         },
         description: `P2P ${label} Agent`,
       });
@@ -453,8 +472,18 @@ export class P2PAgenticStack extends cdk.Stack {
       // Grant permissions
       gateway.grantRead(runtime);
       codeInterpreter.grantUse(runtime);
-      // Runtimes only need lifecycle table (runs[] tracking)
+      // All runtimes track their events in the document lifecycle table.
       lifecycleTable.grantReadWriteData(runtime);
+      if (name === "workflow") {
+        workflowCheckpointTable.grant(
+          runtime,
+          "dynamodb:GetItem",
+          "dynamodb:PutItem",
+          "dynamodb:Query",
+          "dynamodb:BatchGetItem",
+          "dynamodb:BatchWriteItem",
+        );
+      }
       erpnextSecret.grantRead(runtime);
 
       // Grant Bedrock model invocation
@@ -492,6 +521,82 @@ export class P2PAgenticStack extends cdk.Stack {
       runtimeArns[name] = runtime.agentRuntimeArn;
     }
 
+    const workflowMetric = (metricName: string, options: cloudwatch.MetricOptions = {}) => new cloudwatch.Metric({
+      namespace: "ARIA/Workflow",
+      metricName,
+      period: cdk.Duration.minutes(5),
+      statistic: "Sum",
+      ...options,
+      dimensionsMap: { Deployment: prefix, ...options.dimensionsMap },
+    });
+    const poReview = workflowMetric("POReviewEntered", { label: "PO review" });
+    const workflowErrors = workflowMetric("WorkflowErrors", { label: "Workflow errors" });
+    const checkpointFailures = workflowMetric("CheckpointFailures", { label: "Checkpoint failures" });
+    const erpToolFailures = workflowMetric("ERPToolFailures", { label: "ERP tool failures" });
+
+    const poReviewAlarm = poReview.createAlarm(this, "WorkflowPoReviewAlarm", {
+      alarmName: `${prefix}-workflow-po-review`,
+      alarmDescription: "A purchase order entered manual review in the last five minutes.",
+      threshold: 1,
+      evaluationPeriods: 1,
+      comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
+      treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+    });
+    const infrastructureFailures = new cloudwatch.MathExpression({
+      expression: "FILL(checkpoints, 0) + FILL(erp, 0)",
+      usingMetrics: { checkpoints: checkpointFailures, erp: erpToolFailures },
+      period: cdk.Duration.minutes(5),
+    });
+    const workflowErrorsAlarm = infrastructureFailures.createAlarm(this, "WorkflowErrorsAlarm", {
+      alarmName: `${prefix}-workflow-errors`,
+      alarmDescription: "More than three checkpoint or ERP tool failures in five minutes.",
+      threshold: 3,
+      evaluationPeriods: 1,
+      comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_THRESHOLD,
+      treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+    });
+    const workflowAlerts = new sns.Topic(this, "WorkflowAlerts", {
+      topicName: `${prefix}-workflow-alerts`,
+    });
+    const notifyWorkflowOperators = new cloudwatchActions.SnsAction(workflowAlerts);
+    poReviewAlarm.addAlarmAction(notifyWorkflowOperators);
+    workflowErrorsAlarm.addAlarmAction(notifyWorkflowOperators);
+
+    const workflowDashboard = new cloudwatch.Dashboard(this, "WorkflowDashboard", {
+      dashboardName: `${prefix}-workflow`,
+    });
+    workflowDashboard.addWidgets(
+      new cloudwatch.GraphWidget({
+        title: "Workflow outcomes", width: 12,
+        left: ["PO_CREATED", "REJECTED", "PENDING_APPROVAL", "FAILED", "PO_REVIEW"].map((Outcome) =>
+          workflowMetric("WorkflowOutcome", { label: Outcome, dimensionsMap: { Outcome } }),
+        ),
+      }),
+      new cloudwatch.GraphWidget({
+        title: "Workflow errors and PO review", width: 12,
+        left: [workflowErrors, checkpointFailures, erpToolFailures, poReview],
+      }),
+    );
+    workflowDashboard.addWidgets(
+      new cloudwatch.GraphWidget({
+        title: "Workflow step duration (p95 ms)", width: 12,
+        left: ["sourcing", "requisition_analysis", "policy_route", "human_review", "create_or_recover_po", "await_reconciliation"]
+          .map((Step) => workflowMetric("StepDurationMs", { label: Step, statistic: "p95", dimensionsMap: { Step } })),
+      }),
+      new cloudwatch.GraphWidget({
+        title: "Approval wait and ERP tool duration (p95 ms)", width: 12,
+        left: [workflowMetric("ApprovalWaitMs", { label: "Approval wait", statistic: "p95" })],
+        right: [workflowMetric("ERPToolDurationMs", { label: "ERP tool duration", statistic: "p95" })],
+      }),
+    );
+    workflowDashboard.addWidgets(
+      new cloudwatch.GraphWidget({
+        title: "Bedrock tokens", width: 12,
+        left: [workflowMetric("BedrockInputTokens", { label: "Input" }), workflowMetric("BedrockOutputTokens", { label: "Output" })],
+      }),
+      new cloudwatch.AlarmStatusWidget({ title: "Workflow alarms", width: 12, alarms: [poReviewAlarm, workflowErrorsAlarm] }),
+    );
+
     // =====================================================================
     // Backend API Lambda (FastAPI — dashboard, decisions, notifications)
     // =====================================================================
@@ -515,6 +620,7 @@ export class P2PAgenticStack extends cdk.Stack {
       environment: {
         DATA_SOURCE: "erpnext",
         DYNAMODB_TABLE_PREFIX: prefix,
+        P2P_EMF_LOGS: "1",
         COGNITO_USER_POOL_ID: userPool.userPoolId,
         COGNITO_APP_CLIENT_ID: frontendClient.userPoolClientId,
         AWS_REGION_NAME: this.region,

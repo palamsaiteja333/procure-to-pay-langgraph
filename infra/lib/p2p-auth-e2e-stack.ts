@@ -80,12 +80,18 @@ export class P2PAuthE2EStack extends cdk.Stack {
     });
 
     // Same tool names as the production target so the production policy file
-    // applies unchanged. Schemas are permissive; the stub ignores arguments.
-    const tools = cedarToolNames(CEDAR_POLICY_FILE).map((name) => ({
-      name,
-      description: `Stub for ${name}`,
-      inputSchema: { type: agentcore.SchemaDefinitionType.OBJECT, properties: {} },
-    }));
+    // applies unchanged. Expose the optional input fields Cedar checks.
+    const workflowIdentityTools = new Set(["get_supplier", "get_requisition", "create_purchase_order"]);
+    const tools = cedarToolNames(CEDAR_POLICY_FILE).map((name) => {
+      const properties: Record<string, agentcore.SchemaDefinition> = {};
+      if (workflowIdentityTools.has(name)) properties.user_email = { type: agentcore.SchemaDefinitionType.STRING };
+      if (name === "create_purchase_order") properties.idempotency_key = { type: agentcore.SchemaDefinitionType.STRING };
+      return {
+        name,
+        description: `Stub for ${name}`,
+        inputSchema: { type: agentcore.SchemaDefinitionType.OBJECT, properties },
+      };
+    });
 
     const gatewayTarget = gateway.addLambdaTarget("StubErp", {
       gatewayTargetName: "erp",

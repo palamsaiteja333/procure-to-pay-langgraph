@@ -9,18 +9,20 @@ Supports tree structure: workflows contain nested step entries via parent_id.
 
 import json
 import logging
-from datetime import datetime, timezone
-from typing import Optional
+import os
+from ipaddress import ip_address
+from typing import Literal, Optional
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
 from services import erp_client
-from services.auth import get_authenticated_user
+from services.auth import _jwt_claims, get_authenticated_user, get_user_email
 from services.lifecycle import (
-    add_run_entry, record_approval, record_rejection,
-    resolve_pending_decision, list_lifecycles, get_lifecycle,
+    WorkflowConflict, get_lifecycle, get_workflow, list_lifecycles,
+    record_standalone_decision, record_workflow_decision,
 )
+from utils import workflow_telemetry as telemetry
 
 logger = logging.getLogger("p2p.api.decisions")
 
@@ -30,12 +32,14 @@ router = APIRouter()
 class DecisionRequest(BaseModel):
     document_type: str          # "PR" or "INVOICE"
     document_id: str
-    action: str                 # "APPROVE" or "REJECT"
+    action: Literal["APPROVE", "REJECT"]
     justification: str = ""
     agent_recommendation: str = ""
     agent_confidence: float = 0.0
     agent_reasoning: str = ""
     match_result: str = ""
+    workflow_run_id: str = ""
+    request_version: str = ""
 
 
 @router.get("/")
@@ -151,41 +155,30 @@ def get_document_runs(document_id: str):
 @router.post("/")
 def record_decision(body: DecisionRequest, request: Request):
     """Record a human approval or rejection decision."""
-    from services.auth import get_user_email
-    auth_user = get_authenticated_user(request)
-    user_email = get_user_email(request)
-    decided_by = user_email or auth_user or "unknown"
-
-    # Map to canonical action names: HUMAN_APPROVED / HUMAN_REJECTED
     canonical_action = "HUMAN_APPROVED" if body.action == "APPROVE" else "HUMAN_REJECTED"
-
-    # Update the existing AI_ESCALATED entry in-place (no duplicate)
-    resolved = resolve_pending_decision(
-        document_id=body.document_id,
-        action=canonical_action,
-        decided_by=decided_by,
-        justification=body.justification,
-    )
-    if not resolved:
-        # No pending decision found — create a new entry (standalone approval)
-        add_run_entry(
-            document_id=body.document_id,
-            entry_type="decision",
-            action=canonical_action,
-            decided_by=decided_by,
-            status="approved" if body.action == "APPROVE" else "rejected",
-            justification=body.justification,
-            confidence=body.agent_confidence,
-            summary=f"Human {body.action.lower()}: {body.justification[:100]}" if body.justification else f"Human {body.action.lower()}",
-        )
-
-    # Update lifecycle status
-    if body.action == "APPROVE":
-        record_approval(body.document_id, approved_by=decided_by)
-    elif body.action == "REJECT":
-        record_rejection(body.document_id, rejected_by=decided_by)
-
-    logger.info("Decision: %s %s %s by %s", body.action, body.document_type, body.document_id, decided_by)
+    try:
+        workflow = get_workflow(body.document_id)
+        if workflow or body.workflow_run_id or body.request_version:
+            if body.document_type != "PR":
+                raise WorkflowConflict("WORKFLOW_DECISION_REQUIRED", "Use a requisition decision for this workflow.")
+            decided_by, user_email = _workflow_approver(request)
+            decision, applied = record_workflow_decision(
+                body.document_id, body.workflow_run_id, body.request_version,
+                canonical_action, decided_by, body.justification, approver_email=user_email,
+            )
+            if applied:
+                telemetry.approval_recorded(
+                    body.workflow_run_id, canonical_action, decision.get("started_at", ""), decision["completed_at"],
+                )
+        else:
+            user_email = get_user_email(request)
+            decided_by = user_email or get_authenticated_user(request) or "unknown"
+            decision = record_standalone_decision(
+                body.document_id, canonical_action, decided_by, body.justification, body.agent_confidence,
+            )
+            logger.info("Standalone decision recorded: %s %s", body.action, body.document_type)
+    except WorkflowConflict as error:
+        raise HTTPException(status_code=409, detail={"code": error.code, "message": str(error)}) from error
 
     # ERPNext status update for invoice overrides
     if body.document_type == "INVOICE" and body.action == "APPROVE":
@@ -198,9 +191,31 @@ def record_decision(body: DecisionRequest, request: Request):
     return {
         "document_id": body.document_id,
         "action": body.action,
-        "decided_by": decided_by,
-        "decided_at": datetime.now(timezone.utc).isoformat(),
+        "decided_by": decision["decided_by"],
+        "decided_at": decision["completed_at"],
     }
+
+
+def _workflow_approver(request: Request) -> tuple[str, str | None]:
+    claims = _jwt_claims(request)
+    if claims:
+        if claims.get("p2p_role") not in {"approver", "procurement", "admin"}:
+            raise HTTPException(status_code=403, detail="This role cannot decide a requisition workflow.")
+        email = claims.get("email") or claims.get("cognito:email")
+        principal = email or claims.get("cognito:username") or claims.get("sub")
+        if principal:
+            return principal, email
+    elif (
+        "aws.event" not in request.scope and os.environ.get("DEPLOYMENT_ENV") == "local"
+        and os.environ.get("P2P_LOCAL_APPROVER") == "1" and request.client
+    ):
+        try:
+            is_loopback = ip_address(request.client.host).is_loopback
+        except ValueError:
+            is_loopback = False
+        if is_loopback:
+            return "local-approver", None
+    raise HTTPException(status_code=401, detail="A verified approver identity is required.")
 
 
 def _try_stop_material_request(mr_id: str, user_email: Optional[str] = None) -> None:

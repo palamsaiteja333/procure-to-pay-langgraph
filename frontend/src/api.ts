@@ -25,23 +25,19 @@ export interface DashboardMetrics {
   vendors?: number;
 }
 
-/** A single logged agent/system error. */
-export interface ErrorRecord {
-  timestamp?: string;
-  agent_name?: string;
-  category?: string;
-  severity?: string;
+/** A lifecycle record for a failed workflow or an unconfirmed purchase order. */
+export interface WorkflowIssue {
+  document_id: string;
   document_type?: string;
-  document_id?: string;
-  message?: string;
-  retry_eligible?: boolean;
+  status: "FAILED" | "PO_REVIEW";
+  updated_at?: string;
+  error?: string;
 }
 
-/** Aggregated error counts. */
+/** Aggregated workflow issue counts. */
 export interface ErrorSummary {
   total_unresolved?: number;
   human_action_needed?: number;
-  by_severity?: Record<string, number>;
 }
 
 /**
@@ -92,6 +88,7 @@ export interface LifecycleRecord {
   runs?: string | unknown[];
   rejected_by?: string;
   po_order_id?: string;
+  po_order_ids?: string[];
 }
 
 /** Async invoice extraction/creation job status. */
@@ -127,6 +124,20 @@ export interface ChatMessageRecord {
   tools_used?: string[];
 }
 
+async function getWorkflowIssues(signal?: AbortSignal): Promise<WorkflowIssue[]> {
+  const statuses: WorkflowIssue["status"][] = ["FAILED", "PO_REVIEW"];
+  const groups = await Promise.all(statuses.map(status =>
+    request<{ lifecycles: WorkflowIssue[] }>(`/lifecycle/?status=${status}`, { signal })
+  ));
+  const sorted = groups.flatMap(group => group.lifecycles)
+    .sort((a, b) => (b.updated_at ?? "").localeCompare(a.updated_at ?? ""));
+  const byDocument = new Map<string, WorkflowIssue>();
+  for (const issue of sorted) {
+    if (!byDocument.has(issue.document_id)) byDocument.set(issue.document_id, issue);
+  }
+  return [...byDocument.values()];
+}
+
 export const api = {
   // Admin
   getDataStatus: () => request<Record<string, unknown>>("/admin/status"),
@@ -134,8 +145,14 @@ export const api = {
   resetData: () => request<Record<string, unknown>>("/admin/reset", { method: "POST" }),
 
   // Errors
-  getErrors: () => request<ErrorRecord[]>("/errors/"),
-  getErrorSummary: () => request<ErrorSummary>("/errors/summary/counts"),
+  getWorkflowIssues,
+  getErrorSummary: async (): Promise<ErrorSummary> => {
+    const issues = await getWorkflowIssues();
+    return {
+      total_unresolved: issues.length,
+      human_action_needed: issues.filter(issue => issue.status === "PO_REVIEW").length,
+    };
+  },
 
   // Audit trail & run history
   getDecisions: () => request<DecisionRun[]>("/decisions/"),
@@ -144,6 +161,8 @@ export const api = {
     document_type: string;
     document_id: string;
     action: string;
+    workflow_run_id?: string;
+    request_version?: string;
     justification?: string;
     agent_recommendation?: string;
     agent_confidence?: number;

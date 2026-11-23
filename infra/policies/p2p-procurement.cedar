@@ -22,6 +22,7 @@ permit(
     AgentCore::Action::"erp___list_purchase_orders",
     AgentCore::Action::"erp___get_purchase_order",
     AgentCore::Action::"erp___create_purchase_order",
+    AgentCore::Action::"erp___reconcile_purchase_order",
     AgentCore::Action::"erp___list_receipts",
     AgentCore::Action::"erp___get_receipt",
     AgentCore::Action::"erp___create_receipt",
@@ -31,7 +32,8 @@ permit(
     AgentCore::Action::"erp___list_payments",
     AgentCore::Action::"erp___create_payment",
     AgentCore::Action::"erp___get_spend_summary",
-    AgentCore::Action::"erp___get_supplier_performance"
+    AgentCore::Action::"erp___get_supplier_performance",
+    AgentCore::Action::"erp___get_budget_status"
   ],
   resource is AgentCore::Gateway
 );
@@ -108,3 +110,21 @@ permit(
    principal.getTag("p2p_role") == "approver" ||
    principal.getTag("p2p_role") == "admin")
 };
+
+// Reserve ERP identity arguments on these shared tools for IAM callers.
+forbid(
+  principal is AgentCore::OAuthUser,
+  action in [
+    AgentCore::Action::"erp___get_supplier",
+    AgentCore::Action::"erp___get_requisition",
+    AgentCore::Action::"erp___create_purchase_order"
+  ],
+  resource is AgentCore::Gateway
+) when { context.input has user_email };
+
+// Keep the controlled PO operation internal to the workflow.
+forbid(
+  principal is AgentCore::OAuthUser,
+  action == AgentCore::Action::"erp___create_purchase_order",
+  resource is AgentCore::Gateway
+) when { context.input has idempotency_key };

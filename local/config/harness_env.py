@@ -25,9 +25,8 @@ CANONICAL_API_PORT = int(os.environ.get("ARIA_CANONICAL_API_PORT", "8001"))  # E
 MCP_GATEWAY_PORT = int(os.environ.get("ARIA_MCP_GATEWAY_PORT", "8002"))  # fastmcp over canonical API
 AGENT_PROXY_PORT = int(os.environ.get("ARIA_AGENT_PROXY_PORT", "8003"))  # browser-facing agent proxy
 AGENTCORE_SHIM_PORT = int(os.environ.get("ARIA_AGENTCORE_SHIM_PORT", "9000"))  # runtime+memory shim
-# moto server mode emulates DynamoDB, S3, and Secrets Manager on ONE port — no
-# separate DynamoDB Local / Java process needed.
-MOTO_PORT = int(os.environ.get("ARIA_MOTO_PORT", "5100"))
+MOTO_PORT = int(os.environ.get("ARIA_MOTO_PORT", "5100"))               # S3 and Secrets Manager
+DYNAMODB_PORT = int(os.environ.get("ARIA_DYNAMODB_PORT", "8100"))       # DynamoDB Local
 
 # One local port per specialized agent (all run backend/agentcore_app.py with a
 # different AGENT_NAME). The runtime shim maps an ARN's kind token to these.
@@ -43,6 +42,7 @@ AGENT_PORTS = {
 
 REGION = os.environ.get("AWS_REGION", "us-east-1")
 TABLE_PREFIX = os.environ.get("ARIA_TABLE_PREFIX", "p2p-dev")
+CHECKPOINT_TABLE = f"{TABLE_PREFIX}-workflow-checkpoints"
 S3_BUCKET = os.environ.get("ARIA_S3_BUCKET", "p2p-dev-documents")
 ERPNEXT_SECRET_NAME = os.environ.get("ARIA_ERPNEXT_SECRET_NAME", "p2p-dev-erpnext")
 
@@ -68,7 +68,7 @@ def endpoint_env() -> dict[str, str]:
     """
     moto = f"http://127.0.0.1:{MOTO_PORT}"
     return {
-        "AWS_ENDPOINT_URL_DYNAMODB": moto,
+        "AWS_ENDPOINT_URL_DYNAMODB": f"http://127.0.0.1:{DYNAMODB_PORT}",
         "AWS_ENDPOINT_URL_S3": moto,
         "AWS_ENDPOINT_URL_SECRETS_MANAGER": moto,
         "AWS_ENDPOINT_URL_BEDROCK_AGENTCORE": f"http://127.0.0.1:{AGENTCORE_SHIM_PORT}",
@@ -86,6 +86,8 @@ def app_env() -> dict[str, str]:
         "AWS_DEFAULT_REGION": REGION,
         "AWS_REGION_NAME": REGION,
         "DEPLOYMENT_ENV": "local",
+        "P2P_LOCAL_APPROVER": os.environ.get("P2P_LOCAL_APPROVER", ""),
+        "P2P_CHECKPOINT_TABLE": CHECKPOINT_TABLE,
         "DYNAMODB_TABLE_PREFIX": TABLE_PREFIX,
         "S3_BUCKET": S3_BUCKET,
         "ERPNEXT_URL": ERPNEXT_URL,

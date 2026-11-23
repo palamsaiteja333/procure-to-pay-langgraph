@@ -13,6 +13,14 @@ class ERPWriteError(RuntimeError):
     """Base class for ERP write failures."""
 
 
+class PurchaseOrderOutcomeError(ERPWriteError):
+    """A keyed PO operation was rejected or its result could not be confirmed."""
+
+    def __init__(self, message: str, *, rejected: bool = False):
+        super().__init__(message)
+        self.rejected = rejected
+
+
 class DuplicatePaymentError(ERPWriteError):
     """A Payment Entry already exists for this invoice.
 

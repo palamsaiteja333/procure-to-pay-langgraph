@@ -39,7 +39,9 @@ CDK TypeScript infrastructure for the P2P Agentic Platform. Two stacks deploy th
 - **Textract** — AnalyzeExpense for invoice PDF extraction
 
 ### Storage
-- **DynamoDB** — 4 tables (agent-jobs, agent-errors, document-lifecycle, simulation-state)
+- **DynamoDB** — document lifecycle, workflow checkpoints, invoice jobs, chat sessions, and simulation state.
+  The workflow runtime alone uses the `workflow-checkpoints` table. CDK retains
+  that table on stack deletion and enables point-in-time recovery.
 - **S3** — Frontend assets + invoice documents
 - **Secrets Manager** — ERPNext credentials (service + per-user API keys)
 - **ECR** — Agent container repository

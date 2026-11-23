@@ -78,12 +78,11 @@ class TestNoSAPFieldsInPromptFStrings:
 class TestLocalToolBuilders:
     """Agents that still have local tool builders should work correctly."""
 
-    def test_requisition_budget_tool(self):
+    def test_requisition_budget_is_supplied_by_gateway(self):
         from agents.requisition_agent import build_budget_tool
-        tool = build_budget_tool()
-        assert callable(tool)
-        name = getattr(tool, "name", getattr(tool, "__name__", ""))
-        assert "budget" in name.lower()
+        from utils.progress_hooks import TOOL_DESCRIPTIONS
+        assert build_budget_tool() == []
+        assert "erp___get_budget_status" in TOOL_DESCRIPTIONS
 
     def test_sourcing_contract_tools(self):
         from agents.sourcing_agent import build_contract_tools

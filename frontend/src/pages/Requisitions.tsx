@@ -17,6 +17,7 @@ import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from "@/components/ui/table";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Spinner } from "@/components/ui/spinner";
+import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 
 /* ---------- Local agent-result shapes ---------- */
 interface SourcingResult {
@@ -27,6 +28,7 @@ interface POResult {
   action?: string;
   reasoning?: string;
   created_order_id?: string;
+  created_order_ids?: string[];
 }
 /** Normalized shape rendered in the analysis / workflow modal. */
 interface AgentResult {
@@ -38,11 +40,14 @@ interface AgentResult {
   auto_approved?: boolean;
   workflow?: boolean;
   workflow_status?: string;
+  workflow_run_id?: string;
+  request_version?: string;
   current_step?: string;
   workflow_steps?: WorkflowStep[];
   sourcing_result?: SourcingResult | null;
   po_result?: POResult | null;
   created_order_id?: string;
+  created_order_ids?: string[];
   erp_action_taken?: string;
   error?: string;
 }
@@ -63,10 +68,14 @@ interface RawWorkflowResult {
   findings?: AgentFinding[];
   auto_approved?: boolean;
   workflow_status?: string;
+  workflow_run_id?: string;
+  request_version?: string;
+  current_step?: string;
   sourcing_result?: SourcingResult;
   recommended_vendor?: SourcingResult["recommended_vendor"];
   po_result?: POResult;
   created_order_id?: string;
+  created_order_ids?: string[];
   erp_action_taken?: string;
 }
 /** A run-history entry (workflow / decision / agent run). */
@@ -81,6 +90,7 @@ interface RunEntry {
   confidence?: number | string;
   started_at?: string;
   summary?: string;
+  request_version?: string;
   result?: Record<string, unknown>;
 }
 
@@ -327,6 +337,7 @@ export default function Requisitions() {
   const [expandedLineItems, setExpandedLineItems] = useState(true);
   const [justification, setJustification] = useState("");
   const [submitting, setSubmitting] = useState(false);
+  const [decisionError, setDecisionError] = useState("");
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [bulkApproving, setBulkApproving] = useState(false);
   const [runHistory, setRunHistory] = useState<RunEntry[]>([]);
@@ -418,12 +429,19 @@ export default function Requisitions() {
   }, [agent.result, agent.error, analyzing]);
 
   /* ---------- Agent invocation: Workflow ---------- */
+  const invokeWorkflow = async (documentId: string, resumeFrom?: "po_generation") => {
+    setRunningWorkflow(true);
+    agent.reset();
+    await agent.invoke("workflow", documentId, resumeFrom ? { resume_from: resumeFrom } : undefined);
+  };
+
   const runFullWorkflow = async () => {
     if (!selectedItem) return;
     setShowModal(true);
     setRejectedWorkflow(false);
     setAgentResult(null);
     setAgentMeta(null);
+    setDecisionError("");
     setRunHistory([]);
     setRunHistoryExpanded(true);
 
@@ -438,7 +456,7 @@ export default function Requisitions() {
 
       // Helper: extract step data from runs[] array
       const runs: RunEntry[] = typeof lc?.runs === "string" ? JSON.parse(lc.runs || "[]") : ((lc?.runs as RunEntry[]) || []);
-      const latestWorkflow = [...runs].reverse().find((r) => r.type === "workflow");
+      const latestWorkflow = [...runs].reverse().find((r) => r.type === "workflow" && r.agent === "workflow");
       const wfChildren = latestWorkflow ? runs.filter((r) => r.parent_id === latestWorkflow.id) : [];
       const reqStep = wfChildren.find((r) => r.agent === "requisition");
       const srcStep = wfChildren.find((r) => r.agent === "sourcing");
@@ -451,28 +469,7 @@ export default function Requisitions() {
         vendor_name?: string; vendor_score?: number; reasoning?: string;
       };
 
-      // Check for actively running workflow — prevent duplicate invocation
-      const RUNNING_STATES = ["CREATED", "SOURCING", "SOURCING_COMPLETE", "ANALYZING", "PO_GENERATION"];
-      if (lc?.status && RUNNING_STATES.includes(lc.status)) {
-        setAgentResult({
-          workflow: true,
-          workflow_status: "RUNNING",
-          current_step: lc.current_step || lc.status,
-          reasoning: `A workflow is already running (step: ${lc.current_step || lc.status}). Please wait for it to complete, then refresh to see the result.`,
-          recommendation: reqResult?.recommendation || "",
-          risk_level: reqResult?.risk_level || "",
-          confidence: reqResult?.confidence || 0,
-          findings: reqResult?.findings || [],
-          auto_approved: false,
-          sourcing_result: srcResult?.vendor_name ? {
-            recommended_vendor: { supplier_name: srcResult.vendor_name, score: srcResult.vendor_score },
-            reasoning: srcResult.reasoning || srcStep?.summary || "",
-          } : null,
-        });
-        return;
-      }
-
-      if (lc?.status === "PENDING_APPROVAL" && reqStep) {
+      if (lc?.status === "PENDING_APPROVAL" && reqStep && latestWorkflow?.id && latestWorkflow.request_version) {
         // Restore both analysis AND sourcing from runs[] — no top-level duplication
         const findings = reqResult.findings || [];
         setAgentResult({
@@ -484,6 +481,8 @@ export default function Requisitions() {
           auto_approved: false,
           workflow: true,
           workflow_status: "PENDING_APPROVAL",
+          workflow_run_id: latestWorkflow.id,
+          request_version: latestWorkflow.request_version,
           sourcing_result: srcResult.vendor_name ? {
             recommended_vendor: { supplier_name: srcResult.vendor_name, score: srcResult.vendor_score },
             reasoning: srcResult.reasoning || srcStep?.summary || "",
@@ -491,12 +490,13 @@ export default function Requisitions() {
         });
         return;
       }
-      if (lc?.status === "PO_CREATED" && reqStep) {
-        const poResult = (poStep?.result || {}) as { created_order_id?: string };
+      const poResult = (poStep?.result || {}) as POResult;
+      if (lc?.status === "PO_CREATED" || (latestWorkflow?.status === "completed" && poResult.created_order_id)) {
         setAgentResult({
           workflow: true,
           workflow_status: "COMPLETE",
-          created_order_id: poResult.created_order_id || lc.po_order_id || "",
+          created_order_id: poResult.created_order_id || lc?.po_order_id || "",
+          created_order_ids: poResult.created_order_ids || lc?.po_order_ids,
           recommendation: reqResult.recommendation || "APPROVE",
           risk_level: reqResult.risk_level || "",
           confidence: reqResult.confidence || 0,
@@ -522,15 +522,50 @@ export default function Requisitions() {
         });
         return;
       }
-    } catch { /* lifecycle fetch failed — proceed fresh */ }
+      if (latestWorkflow?.id && ["CREATED", "SOURCING", "SOURCING_COMPLETE", "ANALYZING", "APPROVED", "PO_GENERATION", "PO_REVIEW"].includes(lc?.status || "")) {
+        await invokeWorkflow(selectedItem.requisition_id);
+        return;
+      }
+    } catch { /* The runtime can look up the lifecycle on invocation. */ }
 
-    // No existing lifecycle or in a restartable state — invoke fresh
-    setRunningWorkflow(true);
-    agent.reset();
+    if (selectedItem.status === "ordered") {
+      setAgentResult({ error: "This requisition is already ordered. Refresh to check its workflow or view the purchase order in ERP." });
+      return;
+    }
+    // A legacy pending approval is loaded by the runtime before it can be reviewed.
+    await invokeWorkflow(selectedItem.requisition_id);
+  };
+
+  const submitWorkflowDecision = async (action: "APPROVE" | "REJECT") => {
+    if (!selectedItem || !agentResult?.workflow_run_id || !agentResult.request_version) return;
+
+    setSubmitting(true);
+    setDecisionError("");
     try {
-      await agent.invoke("workflow", selectedItem.requisition_id);
-    } catch {
-      // Error captured in agent.error
+      await api.recordDecision({
+        document_type: "PR",
+        document_id: selectedItem.requisition_id,
+        action,
+        workflow_run_id: agentResult.workflow_run_id,
+        request_version: agentResult.request_version,
+        justification,
+        agent_recommendation: agentResult.recommendation,
+        agent_confidence: agentResult.confidence,
+        agent_reasoning: agentResult.reasoning,
+      });
+      setJustification("");
+      setAgentResult(null);
+      if (action === "REJECT") {
+        setRejectedWorkflow(true);
+        void fetchData();
+      } else {
+        await invokeWorkflow(selectedItem.requisition_id, "po_generation");
+      }
+    } catch (error) {
+      console.error("Could not submit workflow decision:", error);
+      setDecisionError("Could not confirm the decision. Close this window and reopen Run Full Workflow to check the latest status.");
+    } finally {
+      setSubmitting(false);
     }
   };
 
@@ -551,16 +586,21 @@ export default function Requisitions() {
         recommendation: result.recommendation || result.status || "",
         risk_level: result.risk_level || "",
         confidence: result.confidence || 0,
-        reasoning: result.reasoning || result.message || result.error || "",
+        reasoning: result.reasoning || result.message || "",
         findings: result.findings || [],
         auto_approved: result.auto_approved || false,
         workflow: true,
-        workflow_status: result.workflow_status || result.status,
+        workflow_status: result.status === "PO_REVIEW" ? result.status : result.workflow_status || result.status,
+        workflow_run_id: result.workflow_run_id,
+        request_version: result.request_version,
+        current_step: result.current_step,
         workflow_steps: steps,
         sourcing_result: result.sourcing_result || (srcStep?.result || result.recommended_vendor ? { recommended_vendor: result.recommended_vendor, ...srcStep?.result } : null),
         po_result: result.po_result || poStep?.result || null,
         created_order_id: result.created_order_id || "",
+        created_order_ids: result.created_order_ids || result.po_result?.created_order_ids,
         erp_action_taken: result.erp_action_taken || "",
+        error: result.error,
       };
       // Defer off the render commit (avoids synchronous setState in effect).
       queueMicrotask(() => {
@@ -579,6 +619,10 @@ export default function Requisitions() {
   }, [agent.result, agent.error, runningWorkflow]);
 
   /* ---------- Derived data ---------- */
+  const reviewingPurchaseOrder = agentResult?.workflow_status === "PO_REVIEW";
+  const submittedOrderIds = agentResult?.created_order_ids?.length
+    ? agentResult.created_order_ids
+    : agentResult?.created_order_id ? [agentResult.created_order_id] : [];
   const tabItems = getTabItems();
   const filtered = filterText
     ? tabItems.filter((r) =>
@@ -655,7 +699,7 @@ export default function Requisitions() {
                     Bulk Approve ({selectedIds.size})
                   </Button>
                 )}
-                <Button variant="outline" size="sm" disabled={!selectedItem || selectedItem.status === "ordered"} onClick={runFullWorkflow} loading={runningWorkflow} title="Runs 3 agents in sequence: Requisition Analysis → Supplier Sourcing → PO Generation. Fully automated end-to-end.">
+                <Button variant="outline" size="sm" onClick={runFullWorkflow} loading={runningWorkflow} title="Start, resume, or view the requisition workflow">
                   Run Full Workflow
                 </Button>
                 <Button size="sm" disabled={!selectedItem || selectedItem.status === "ordered"} onClick={analyzeSelected} loading={analyzing} title="Runs the Requisition Agent to analyze risk, pricing, duplicates, and budget. You approve/reject the findings.">
@@ -850,6 +894,18 @@ export default function Requisitions() {
             </div>
           ) : agentResult ? (
             <div className="space-y-5">
+              {reviewingPurchaseOrder && (
+                <Alert variant="warning">
+                  <AlertTriangle className="h-4 w-4" />
+                  <AlertTitle>Reconcile purchase orders</AlertTitle>
+                  <AlertDescription className="space-y-2">
+                    {submittedOrderIds.length > 0 && (
+                      <p>ERPNext confirmed submission for <span className="font-mono">{submittedOrderIds.join(", ")}</span>.</p>
+                    )}
+                    <p>{agentResult.error || "Check the existing orders in ERPNext before creating another order. Reopen Run Full Workflow to reconcile this request."}</p>
+                  </AlertDescription>
+                </Alert>
+              )}
               {/* Recommendation / Risk / Confidence */}
               {agentResult.recommendation && (
                 <div className="grid grid-cols-3 gap-4">
@@ -888,10 +944,10 @@ export default function Requisitions() {
                 <FindingsList findings={agentResult.findings} />
               )}
 
-              {/* Workflow step 2: Sourcing */}
+              {/* Sourcing results */}
               {agentResult.workflow && agentResult.sourcing_result && (
                 <div className="space-y-2 border-t pt-4">
-                  <h3 className="text-sm font-semibold">Step 2: Vendor Sourcing</h3>
+                  <h3 className="text-sm font-semibold">Vendor Sourcing</h3>
                   {agentResult.sourcing_result.recommended_vendor && (
                     <div className="flex items-center gap-2 text-sm">
                       <CheckCircle2 className="h-4 w-4 text-success" />
@@ -929,14 +985,14 @@ export default function Requisitions() {
                   <div className="flex items-center gap-2">
                     {agentResult.workflow_status === "RUNNING" && <Spinner size="sm" />}
                     <StatusBadge status={agentResult.workflow_status === "COMPLETE" ? "completed" : agentResult.workflow_status === "RUNNING" ? "submitted" : "warning"}>
-                      {agentResult.workflow_status === "RUNNING" ? "In Progress" : agentResult.workflow_status}
+                      {reviewingPurchaseOrder ? "PO Review Required" : agentResult.workflow_status === "RUNNING" ? "In Progress" : agentResult.workflow_status}
                     </StatusBadge>
                   </div>
                 </div>
               )}
 
               {/* Error */}
-              {agentResult.error && (
+              {agentResult.error && !reviewingPurchaseOrder && (
                 <div className="rounded-lg border border-destructive/50 bg-destructive/5 p-3 text-sm text-destructive">
                   {agentResult.error}
                 </div>
@@ -1008,16 +1064,18 @@ export default function Requisitions() {
               )}
 
               {/* Workflow footer — approve/reject for PENDING_APPROVAL, or show PO created */}
-              {!agentResult.error && agentResult.workflow && (
+              {!agentResult.error && agentResult.workflow && !reviewingPurchaseOrder && (
                 <div className="space-y-3 pt-2 border-t">
-                  {agentResult.workflow_status === "COMPLETE" && agentResult.created_order_id && (
+                  {agentResult.workflow_status === "COMPLETE" && submittedOrderIds.length > 0 && (
                     <div className="flex items-center gap-2">
                       <CheckCircle2 className="h-5 w-5 text-green-500" />
-                      <span className="text-sm font-medium">Purchase Order {agentResult.created_order_id} created in ERP</span>
+                      <span className="text-sm font-medium">
+                        {submittedOrderIds.length > 1 ? "Purchase Orders" : "Purchase Order"} {submittedOrderIds.join(", ")} created in ERP
+                      </span>
                       {agentResult.auto_approved && <StatusBadge status="approved">Auto-Approved</StatusBadge>}
                     </div>
                   )}
-                  {agentResult.workflow_status === "COMPLETE" && !agentResult.created_order_id && (
+                  {agentResult.workflow_status === "COMPLETE" && submittedOrderIds.length === 0 && (
                     <div className="flex items-center gap-2">
                       <StatusBadge status="completed">Workflow Complete</StatusBadge>
                     </div>
@@ -1025,6 +1083,13 @@ export default function Requisitions() {
                   {agentResult.workflow_status === "PENDING_APPROVAL" && (
                     <>
                       <p className="text-sm font-medium text-amber-600 dark:text-amber-400">Analysis and sourcing are complete. Review the findings above and approve or reject.</p>
+                      {(decisionError || !agentResult.workflow_run_id || !agentResult.request_version) && (
+                        <Alert variant="destructive">
+                          <AlertDescription>
+                            {decisionError || "The approval is missing its review details. Close this window and reopen Run Full Workflow."}
+                          </AlertDescription>
+                        </Alert>
+                      )}
                       <Input
                         placeholder="Justification (optional)..."
                         value={justification}
@@ -1034,54 +1099,15 @@ export default function Requisitions() {
                         <Button
                           variant="destructive"
                           size="sm"
-                          disabled={submitting}
-                          onClick={async () => {
-                            setSubmitting(true);
-                            try {
-                              await api.recordDecision({
-                                document_type: "PR",
-                                document_id: selectedItem?.requisition_id || "",
-                                action: "REJECT",
-                                justification,
-                                agent_recommendation: agentResult.recommendation,
-                                agent_confidence: agentResult.confidence,
-                                agent_reasoning: agentResult.reasoning,
-                              });
-                              setJustification("");
-                              setRejectedWorkflow(true);
-                              setAgentResult(null);
-                              fetchData();
-                            } catch (e) { console.error(e); }
-                            setSubmitting(false);
-                          }}
+                          disabled={submitting || !agentResult.workflow_run_id || !agentResult.request_version}
+                          onClick={() => submitWorkflowDecision("REJECT")}
                         >
                           Reject
                         </Button>
                         <Button
                           size="sm"
-                          disabled={submitting}
-                          onClick={async () => {
-                            setSubmitting(true);
-                            try {
-                              // Record the human approval decision
-                              await api.recordDecision({
-                                document_type: "PR",
-                                document_id: selectedItem?.requisition_id || "",
-                                action: "APPROVE",
-                                justification,
-                                agent_recommendation: agentResult.recommendation,
-                                agent_confidence: agentResult.confidence,
-                                agent_reasoning: agentResult.reasoning,
-                              });
-                              // Resume the workflow from PO generation (Steps 1+2 already done)
-                              setJustification("");
-                              setRunningWorkflow(true);
-                              setAgentResult(null);
-                              agent.reset();
-                              await agent.invoke("workflow", selectedItem?.requisition_id || "", { resume_from: "po_generation" });
-                            } catch (e) { console.error(e); }
-                            setSubmitting(false);
-                          }}
+                          disabled={submitting || !agentResult.workflow_run_id || !agentResult.request_version}
+                          onClick={() => submitWorkflowDecision("APPROVE")}
                         >
                           {submitting ? "Processing..." : "Approve & Generate PO"}
                         </Button>

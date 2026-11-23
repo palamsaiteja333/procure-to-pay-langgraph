@@ -16,12 +16,10 @@ class TestRequisitionAgent:
         assert isinstance(SYSTEM_PROMPT, str)
         assert len(SYSTEM_PROMPT) > 50
 
-    def test_build_budget_tool(self):
-        from agents.requisition_agent import build_budget_tool
-        tool = build_budget_tool()
-        assert callable(tool)
-        name = getattr(tool, "name", getattr(tool, "__name__", ""))
-        assert "budget" in name.lower()
+    def test_prompt_requires_cost_center_budget_evidence(self):
+        from agents.requisition_agent import SYSTEM_PROMPT
+        assert "get_budget_status" in SYSTEM_PROMPT
+        assert "cost_center" in SYSTEM_PROMPT
 
 
 class TestInvoiceMatchingAgent:
@@ -62,13 +60,12 @@ class TestReceivingAgent:
 
 
 class TestChatAgent:
-    def test_build_local_tools(self):
-        from agents.chat_agent import _build_local_tools
-        tools = _build_local_tools()
-        assert isinstance(tools, list)
-        assert len(tools) >= 1
-        tool_names = [getattr(t, "name", getattr(t, "__name__", "")) for t in tools]
-        assert any("workflow" in n.lower() for n in tool_names)
+    def test_build_erp_tools(self, monkeypatch):
+        from agents.chat_agent import _build_erp_tools_rest
+        from services import erp_client
+        monkeypatch.setattr(erp_client, "is_configured", lambda: True)
+        tool_names = {tool.tool_name for tool in _build_erp_tools_rest()}
+        assert {"erp__list_requisitions", "erp__create_requisition"} <= tool_names
 
     def test_invoke_exists(self):
         from agents.chat_agent import invoke

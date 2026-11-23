@@ -6,8 +6,8 @@ Plays the role a docker-compose file would, but as a Python supervisor so all
 child logs stream into one tagged, followable output (Lumina found compose hid
 agent logs). It:
 
-  1. Starts moto (DynamoDB + S3 + Secrets Manager emulators) on one port.
-  2. Waits for moto, then provisions tables/bucket/secret (init_aws.py).
+  1. Starts Moto for S3 and Secrets Manager.
+  2. Provisions tables in DynamoDB Local and a bucket and secret in Moto.
   3. Starts the AgentCore shim (runtime + memory), the MCP gateway shim, and the
      browser-facing agent proxy shim.
   4. Starts the seven agent processes (run_agent.py per AGENT_NAME).
@@ -17,11 +17,11 @@ agent logs). It:
 Every child inherits the endpoint + app env from local/config/harness_env.py, so
 the unmodified application wires itself to local infra. Bedrock stays real.
 
-ERPNext itself runs via infra/docker/docker-compose.local-test.yaml (started
-separately by the Makefile), and the frontend runs via `npm run dev` (also the
-Makefile) — both are long-lived and external to this supervisor.
+DynamoDB Local and ERPNext run in separate Docker Compose projects. The
+frontend runs via `npm run dev`. These processes outlive the supervisor.
 
 Usage:
+    make -C local dynamodb
     python local/supervisor.py
 """
 
@@ -132,11 +132,11 @@ def main() -> int:
     signal.signal(signal.SIGINT, _sig)
     signal.signal(signal.SIGTERM, _sig)
 
-    # 1) Emulators (moto: dynamodb + s3 + secretsmanager on one port).
+    # 1) Moto serves S3 and Secrets Manager. Make starts DynamoDB Local separately.
     sup.spawn("moto", [PY, "-m", "moto.server", "-p", str(H.MOTO_PORT)])
     _wait_for_moto()
 
-    # 2) Provision tables/bucket/secret.
+    # 2) Provision persistent DynamoDB tables and the Moto bucket and secret.
     rc = subprocess.run(  # nosec B603  # nosemgrep: dangerous-subprocess-use-audit
         [PY, str(LOCAL / "scripts" / "init_aws.py")],
         env={**os.environ, **H.app_env()},

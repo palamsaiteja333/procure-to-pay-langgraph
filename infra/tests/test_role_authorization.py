@@ -147,12 +147,12 @@ def oauth_principal_entity(claims: dict) -> dict:
     }
 
 
-def is_allowed(policies: str, claims: dict, tool: str) -> bool:
+def is_allowed(policies: str, claims: dict, tool: str, inputs: dict | None = None) -> bool:
     request = {
         "principal": f'AgentCore::OAuthUser::"{claims["sub"]}"',
         "action": f'AgentCore::Action::"{tool}"',
         "resource": f'AgentCore::Gateway::"{GATEWAY_ARN}"',
-        "context": {"input": {}},
+        "context": {"input": inputs or {}},
     }
     result = cedarpy.is_authorized(request, policies, [oauth_principal_entity(claims)])
     assert not result.diagnostics.errors, result.diagnostics.errors
@@ -165,6 +165,18 @@ REQUESTER = {
     "custom:role": "requester",
     "custom:department": "Manufacturing",
 }
+
+
+@pytest.mark.parametrize(("tool", "inputs"), [
+    ("erp___get_supplier", {"user_email": "other@example.com"}),
+    ("erp___get_requisition", {"user_email": "other@example.com"}),
+    ("erp___create_purchase_order", {"user_email": "other@example.com"}),
+    ("erp___create_purchase_order", {"idempotency_key": "workflow:allocation"}),
+])
+def test_oauth_cannot_supply_workflow_arguments(pre_token, policies, tool, inputs):
+    claims = issue_id_token(pre_token, REQUESTER, groups=["procurement"])
+    assert is_allowed(policies, claims, tool)
+    assert not is_allowed(policies, claims, tool, inputs)
 
 
 # --------------------------------------------------------------------------

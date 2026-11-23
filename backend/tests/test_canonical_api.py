@@ -4,13 +4,15 @@
 
 import pytest
 import os
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 from fastapi.testclient import TestClient
 
+from adapters.errors import PurchaseOrderOutcomeError
 from adapters.models import (
     SupplierList, Supplier, ItemList, Item,
     RequisitionList, Requisition, RequisitionLineItem,
-    PurchaseOrderList, PurchaseOrder, PurchaseOrderLineItem,
+    OrderStatus, PurchaseOrderList, PurchaseOrder, PurchaseOrderLineItem,
     ReceiptList, Receipt,
     InvoiceList, Invoice,
     PaymentList, Payment,
@@ -128,6 +130,11 @@ class TestRequisitionEndpoints:
 
 
 class TestPurchaseOrderEndpoints:
+    keyed_request = {
+        "idempotency_key": "workflow:allocation", "supplier_id": "SUP-001", "line_items": [],
+        "approved_request_version": "a" * 64, "currency": "USD",
+    }
+
     def test_list_orders(self, client):
         resp = client.get("/purchase-orders")
         assert resp.status_code == 200
@@ -143,6 +150,86 @@ class TestPurchaseOrderEndpoints:
         data = resp.json()
         assert data["order_id"] == "PO-001"
         assert data["line_items"][0]["item_id"] == "ITM-001"
+
+    def test_unkeyed_create_response(self, client, mock_adapter):
+        mock_adapter.create_purchase_order.return_value = mock_adapter.get_purchase_order.return_value
+
+        resp = client.post("/purchase-orders", json={"supplier_id": "SUP-001", "line_items": []})
+
+        assert resp.status_code == 201
+        assert resp.json()["order_id"] == "PO-001"
+
+    def test_keyed_create_unknown_response_for_local_mcp(self, client, mock_adapter):
+        mock_adapter.create_purchase_order.side_effect = PurchaseOrderOutcomeError("Could not confirm PO")
+
+        resp = client.post("/purchase-orders", json=self.keyed_request)
+
+        assert resp.status_code == 200
+        assert resp.json() == {"status": "unknown", "error_code": "PO_OUTCOME_UNKNOWN",
+                               "error": "Could not confirm PO"}
+
+    def test_reconcile_response_for_local_mcp(self, client, mock_adapter):
+        draft = mock_adapter.get_purchase_order.return_value
+        mock_adapter.reconcile_purchase_order.side_effect = [
+            None, draft, draft.model_copy(update={"status": OrderStatus.SUBMITTED}),
+            PurchaseOrderOutcomeError("Could not confirm PO"),
+        ]
+        body = {"idempotency_key": "workflow:allocation"}
+
+        assert client.post("/purchase-orders/reconcile", json=body).json() == {"status": "missing"}
+        assert client.post("/purchase-orders/reconcile", json=body).json()["status"] == "draft"
+        found = client.post("/purchase-orders/reconcile", json=body).json()
+        assert found["status"] == "submitted"
+        assert found["purchase_order"]["order_id"] == "PO-001"
+        assert client.post("/purchase-orders/reconcile", json=body).json()["status"] == "unknown"
+
+    @pytest.mark.parametrize(("path", "method"), [
+        ("/purchase-orders", "create_purchase_order"),
+        ("/purchase-orders/reconcile", "reconcile_purchase_order"),
+    ])
+    def test_keyed_po_operations_are_internal(self, client, mock_adapter, monkeypatch, path, method):
+        from adapters.canonical_api import Caller, _caller, app
+
+        monkeypatch.setitem(app.dependency_overrides, _caller, lambda: Caller(email="buyer@example.com"))
+
+        resp = client.post(path, json=self.keyed_request)
+
+        assert resp.status_code == 403
+        getattr(mock_adapter, method).assert_not_called()
+
+    @pytest.mark.parametrize("tool", ["create_purchase_order", "reconcile_purchase_order"])
+    def test_gateway_returns_structured_unknown_outcome(self, client, mock_adapter, tool):
+        from adapters.canonical_api import handler
+
+        getattr(mock_adapter, tool).side_effect = PurchaseOrderOutcomeError("Could not confirm PO")
+        context = SimpleNamespace(client_context=SimpleNamespace(
+            custom={"bedrockAgentCoreToolName": f"erp___{tool}"},
+        ))
+        event = dict(self.keyed_request)
+
+        assert handler(event, context) == {"status": "unknown", "error_code": "PO_OUTCOME_UNKNOWN",
+                                           "error": "Could not confirm PO"}
+
+    def test_keyed_create_requires_approval_version_and_currency(self, client, mock_adapter):
+        payload = {key: val for key, val in self.keyed_request.items() if key != "approved_request_version"}
+        assert client.post("/purchase-orders", json=payload).status_code == 422
+        mock_adapter.create_purchase_order.assert_not_called()
+
+    @pytest.mark.parametrize("operation", ["create_purchase_order", "reconcile_purchase_order"])
+    def test_explicit_identity_disables_service_fallback_on_both_transports(self, client, mock_adapter, operation):
+        from adapters.canonical_api import Caller, handler
+
+        email = "reviewer@example.com"
+        context = SimpleNamespace(client_context=SimpleNamespace(
+            custom={"bedrockAgentCoreToolName": f"erp___{operation}"},
+        ))
+        path = "/purchase-orders" if operation == "create_purchase_order" else "/purchase-orders/reconcile"
+        with patch("adapters.canonical_api._get_adapter", side_effect=PermissionError) as get_adapter:
+            assert handler({**self.keyed_request, "user_email": email}, context)["status"] == "unknown"
+            assert client.post(path, params={"user_email": email}, json=self.keyed_request).json()["status"] == "unknown"
+
+        assert [entry.args[0] for entry in get_adapter.call_args_list] == [Caller(email=email)] * 2
+        getattr(mock_adapter, operation).assert_not_called()
 
 
 class TestReceiptEndpoints:
@@ -174,6 +261,24 @@ class TestPaymentEndpoints:
 
 
 class TestAnalyticsEndpoints:
+    def test_internal_budget_uses_company_scope_on_both_transports(self, client, mock_adapter):
+        from adapters.canonical_api import handler
+
+        context = SimpleNamespace(client_context=SimpleNamespace(
+            custom={"bedrockAgentCoreToolName": "erp___get_budget_status"},
+        ))
+        arguments = {"cost_center": "Operations - AMG", "user_email": "buyer@example.com"}
+        service = MagicMock()
+        service.get_budget_status.return_value = {"budgets": [], "total_count": 0}
+        with patch("adapters.canonical_api._build_service_adapter", return_value=service):
+            assert handler(dict(arguments), context) == {"budgets": [], "total_count": 0}
+            response = client.get("/analytics/budget-status", params=arguments)
+            assert response.json() == {"budgets": [], "total_count": 0}
+
+        mock_adapter.get_budget_status.assert_not_called()
+        assert service.get_budget_status.call_count == 2
+        service.get_budget_status.assert_called_with(cost_center="Operations - AMG")
+
     def test_spend_summary(self, client):
         resp = client.get("/analytics/spend-summary")
         assert resp.status_code == 200

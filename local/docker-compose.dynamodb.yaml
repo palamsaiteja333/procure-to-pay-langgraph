@@ -1,0 +1,18 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+name: aria-p2p-dynamodb
+
+services:
+  dynamodb:
+    image: amazon/dynamodb-local:latest
+    # Docker creates the empty named volume with root ownership.
+    user: "0:0"
+    working_dir: /home/dynamodblocal
+    command: ["-jar", "DynamoDBLocal.jar", "-sharedDb", "-dbPath", "./data", "-disableTelemetry"]
+    ports:
+      - "127.0.0.1:${ARIA_DYNAMODB_PORT:-8100}:8000"
+    volumes:
+      - dynamodb-data:/home/dynamodblocal/data
+
+volumes:
+  dynamodb-data:

@@ -9,7 +9,7 @@ GET /lifecycle/ — list all lifecycle records (for Command Center)
 
 import logging
 from typing import Optional
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, HTTPException, Query
 
 from services.lifecycle import get_lifecycle, list_lifecycles
 
@@ -29,4 +29,7 @@ def get_document_lifecycle(document_id: str):
 @router.get("/")
 def list_document_lifecycles(status: Optional[str] = Query(None)):
     """List all lifecycle records, optionally filtered by status."""
-    return {"lifecycles": list_lifecycles(status=status)}
+    try:
+        return {"lifecycles": list_lifecycles(status=status, raise_on_failure=True)}
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail="Lifecycle records are temporarily unavailable") from exc

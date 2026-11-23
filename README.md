@@ -105,15 +105,14 @@ repository or the demo environment.**
      entirely fictional document content. Prompts contain only the synthetic
      catalog above; no real or sensitive data is sent.
 
-The generated documents live only in your own ERPNext instance and DynamoDB
-lifecycle table (ephemeral, TTL'd); nothing is transmitted to third parties beyond
-the Amazon Bedrock model invocation.
+The generated documents live in your ERPNext instance, with workflow audit history
+and checkpoints in separate DynamoDB tables. Agent reasoning uses Amazon Bedrock.
 
 ---
 
 ## Try it in five minutes (locally)
 
-No AWS deploy required. The [`local/`](local/README.md) harness runs the **entire stack** on your machine — it emulates DynamoDB, S3, and Secrets Manager, shims the AgentCore Runtime, Gateway, and Memory APIs, and runs all seven agents in-process. The only thing that talks to real AWS is **Bedrock** (the actual model calls), so you get genuine agent reasoning without provisioning a thing.
+The [`local/`](local/README.md) harness uses persistent DynamoDB Local for workflow checkpoints and approvals, Moto for S3 and Secrets Manager, and local shims for the AgentCore Runtime, Gateway, and Memory APIs. The agents call **Bedrock** for live model inference.
 
 ```bash
 cp local/env.example local/.env      # add AWS creds for real Bedrock

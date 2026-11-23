@@ -30,18 +30,13 @@ def _mock_aws_env(monkeypatch):
     monkeypatch.setenv("AWS_SESSION_TOKEN", "testing")
 
 
-def _create_dynamo_tables(dynamodb):
-    """Create the DynamoDB tables used by the current P2P backend."""
+def _create_dynamo_tables(dynamodb, table_keys):
+    """Create Moto tables with the requested suffixes and partition keys."""
     prefix = os.environ.get("DYNAMODB_TABLE_PREFIX", "p2p-test")
 
-    simple_tables = {
-        f"{prefix}-agent-decisions": "decision_id",
-        f"{prefix}-agent-errors": "error_id",
-        f"{prefix}-agent-jobs": "job_id",
-    }
-    for table_name, key_name in simple_tables.items():
+    for table_name, key_name in table_keys.items():
         dynamodb.create_table(
-            TableName=table_name,
+            TableName=f"{prefix}-{table_name}",
             KeySchema=[{"AttributeName": key_name, "KeyType": "HASH"}],
             AttributeDefinitions=[{"AttributeName": key_name, "AttributeType": "S"}],
             BillingMode="PAY_PER_REQUEST",
@@ -56,13 +51,26 @@ def mock_dynamo():
 
     with mock_aws():
         dynamodb = boto3.resource("dynamodb", region_name="us-east-1")
-        _create_dynamo_tables(dynamodb)
+        _create_dynamo_tables(dynamodb, {
+            "agent-decisions": "decision_id",
+            "agent-errors": "error_id",
+            "agent-jobs": "job_id",
+        })
         yield dynamodb
 
 
 @pytest.fixture
-def app_client(mock_dynamo):
-    """Return a FastAPI TestClient with mocked DynamoDB tables."""
+def app_client(mock_dynamo, monkeypatch):
+    """Return an operational API client with local test storage and no ERP transport."""
     from fastapi.testclient import TestClient
     from main import app
-    yield TestClient(app)
+    from services import dynamo, erp_client
+
+    _create_dynamo_tables(mock_dynamo, {
+        "document-lifecycle": "document_id",
+        "invoice-jobs": "job_id",
+    })
+    monkeypatch.setattr(dynamo, "dynamodb", mock_dynamo)
+    monkeypatch.setattr(erp_client, "is_configured", lambda: False)
+    with TestClient(app) as client:
+        yield client

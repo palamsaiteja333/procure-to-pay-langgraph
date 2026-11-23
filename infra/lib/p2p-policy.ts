@@ -18,6 +18,8 @@ const POLICY_NAMES = [
   "po_receipt_write",
   "invoice_write",
   "payment_write",
+  "workflow_erp_identity",
+  "workflow_po_key",
 ];
 
 export interface CedarStatement {

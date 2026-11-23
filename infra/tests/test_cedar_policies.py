@@ -3,13 +3,13 @@
 """
 Tests for Cedar policy files — structural validation.
 
-Validates that the Cedar policy file covers the expected P2P authorization
-rules: role-based access control via permit-only policies.
-Dollar limits are enforced at the application layer (_post_process + human approval).
+Validates P2P role permissions and the inputs reserved for the workflow.
 """
 
 import os
 import re
+import json
+from pathlib import Path
 
 import pytest
 
@@ -28,9 +28,18 @@ class TestPolicyStructure:
         permits = re.findall(r"^permit\(", policy_text, re.MULTILINE)
         assert len(permits) == 6, f"Expected 6 permit statements, found {len(permits)}"
 
-    def test_no_forbid_statements(self, policy_text):
-        forbids = re.findall(r"^forbid\(", policy_text, re.MULTILINE)
-        assert len(forbids) == 0
+    def test_workflow_input_guards_match_registered_schema(self, policy_text):
+        schema_file = Path(POLICY_FILE).resolve().parents[1] / "lib" / "openapi" / "p2p-tools.json"
+        tools = {tool["name"]: tool["inputSchema"] for tool in json.loads(schema_file.read_text())}
+        guards = re.findall(r"^forbid\((.*?)when \{ context.input has (\w+) \};", policy_text, re.MULTILINE | re.DOTALL)
+        assert len(guards) == 2
+        for scope, field in guards:
+            assert "principal is AgentCore::OAuthUser" in scope
+            for tool in re.findall(r'"erp___(\w+)"', scope):
+                assert field in tools[tool]["properties"]
+                assert field not in tools[tool].get("required", [])
+        for name in ("get_supplier", "get_requisition", "get_budget_status", "create_purchase_order", "reconcile_purchase_order"):
+            assert "user_email" in tools[name]["properties"]
 
     def test_uses_correct_principal_types(self, policy_text):
         assert "AgentCore::OAuthUser" in policy_text
@@ -60,7 +69,8 @@ class TestRoleClaimSource:
             )
 
     def test_every_write_permit_keys_on_p2p_role(self, policy_text):
-        conditions = re.findall(r"when\s*\{(.*?)\}", policy_text, re.DOTALL)
+        permits = re.findall(r"^permit\(.*?;", policy_text, re.DOTALL | re.MULTILINE)
+        conditions = re.findall(r"when\s*\{(.*?)\}", "\n".join(permits), re.DOTALL)
         assert len(conditions) == 4, "expected 4 role-conditioned write permits"
         for cond in conditions:
             assert 'principal.hasTag("p2p_role")' in cond

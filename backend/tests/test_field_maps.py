@@ -66,7 +66,7 @@ class TestMapStatusToCanonical:
 
     @pytest.mark.parametrize("erpnext_status,expected", [
         ("Draft", "draft"),
-        ("To Receive and Bill", "submitted"),
+        ("To Receive and Bill", "to_receive"),
         ("Completed", "completed"),
         ("Cancelled", "cancelled"),
         ("Closed", "closed"),

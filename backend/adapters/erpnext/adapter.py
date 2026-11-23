@@ -8,17 +8,20 @@ Translates canonical P2P operations to ERPNext REST API calls.
 
 import io
 import logging
+from collections import Counter
+from datetime import date
+from decimal import Decimal, InvalidOperation
 from typing import Optional
 
 import requests
 
 from adapters.erp_adapter_base import ERPAdapterBase
-from adapters.errors import DuplicatePaymentError, PaymentNotPostedError
+from adapters.errors import DuplicatePaymentError, PaymentNotPostedError, PurchaseOrderOutcomeError
 from adapters.models import (
     Supplier, SupplierList,
     Item, ItemList,
     Requisition, RequisitionCreate, RequisitionList, RequisitionLineItem,
-    PurchaseOrder, PurchaseOrderCreate, PurchaseOrderList, PurchaseOrderLineItem,
+    OrderStatus, PurchaseOrder, PurchaseOrderCreate, PurchaseOrderList, PurchaseOrderLineItem,
     Receipt, ReceiptCreate, ReceiptList, ReceiptLineItem,
     Invoice, InvoiceCreate, InvoiceList, InvoiceLineItem,
     Payment, PaymentCreate, PaymentList,
@@ -36,6 +39,7 @@ from adapters.erpnext.field_maps import (
     INVOICE_TO_CANONICAL, INVOICE_ITEM_TO_CANONICAL, INVOICE_LIST_FIELDS,
     PAYMENT_TO_CANONICAL, PAYMENT_LIST_FIELDS,
 )
+from utils.purchase_control import request_version
 
 logger = logging.getLogger("p2p.adapters.erpnext")
 
@@ -43,6 +47,8 @@ DEFAULT_WAREHOUSE = "Stores - AMG"
 DEFAULT_COMPANY = "Apex Manufacturing Group"
 DEFAULT_COST_CENTER = "Main - AMG"
 DEFAULT_DEPARTMENT = "Operations - AMG"
+PO_IDEMPOTENCY_FIELD = "custom_p2p_order_key"
+_PO_REQUEST_TIMEOUT = (2, 5)
 
 
 class ERPNextAdapter(ERPAdapterBase):
@@ -135,7 +141,10 @@ class ERPNextAdapter(ERPAdapterBase):
         return RequisitionList(requisitions=reqs, total_count=len(reqs))
 
     def get_requisition(self, requisition_id: str) -> Requisition:
-        record = self.client.get("Material Request", requisition_id)
+        return self._map_requisition(self.client.get("Material Request", requisition_id))
+
+    @staticmethod
+    def _map_requisition(record: dict) -> Requisition:
         mapped = map_record(record, REQUISITION_TO_CANONICAL)
         mapped["status"] = map_status_to_canonical(record.get("status", ""), "Material Request")
         # Map line items
@@ -247,7 +256,10 @@ class ERPNextAdapter(ERPAdapterBase):
         return PurchaseOrderList(purchase_orders=orders, total_count=len(orders))
 
     def get_purchase_order(self, order_id: str) -> PurchaseOrder:
-        record = self.client.get("Purchase Order", order_id)
+        return self._map_purchase_order(self.client.get("Purchase Order", order_id))
+
+    @staticmethod
+    def _map_purchase_order(record: dict) -> PurchaseOrder:
         mapped = map_record(record, PO_TO_CANONICAL)
         mapped["status"] = map_status_to_canonical(record.get("status", ""), "Purchase Order")
         items = []
@@ -257,13 +269,50 @@ class ERPNextAdapter(ERPAdapterBase):
         mapped["line_items"] = items
         return PurchaseOrder(**mapped)
 
+    @staticmethod
+    def _check_keyed_po_quantity(line: PurchaseOrderLineItem, request_row: dict, *, submitting: bool) -> float:
+        try:
+            request_qty = Decimal(str(request_row.get("qty") or 0))
+            stock_value = request_row.get("stock_qty")
+            stock_qty = Decimal(str(stock_value)) if stock_value is not None else None
+            conversion = request_row.get("conversion_factor")
+            if conversion is not None:
+                factor = Decimal(str(conversion))
+            elif stock_qty is not None and request_qty > 0:
+                factor = stock_qty / request_qty
+            else:
+                factor = Decimal(1)
+            requested_stock = stock_qty if stock_qty is not None else request_qty * factor
+            ordered_stock = Decimal(str(request_row.get("ordered_qty") or request_row.get("received_qty") or 0))
+            proposed_stock = Decimal(str(line.quantity)) * factor
+            if not all(value.is_finite() for value in (factor, requested_stock, ordered_stock, proposed_stock)):
+                raise ValueError("Non-finite quantity")
+            if factor <= 0 or ordered_stock < 0 or proposed_stock <= 0:
+                raise ValueError("Invalid conversion or quantity")
+        except (InvalidOperation, ValueError) as exc:
+            raise PurchaseOrderOutcomeError(
+                f"Could not verify the remaining quantity for {line.item_id} on Material Request "
+                f"{line.requisition_id}", rejected=True,
+            ) from exc
+
+        # ERPNext tracks ordered_qty in stock units, while the approved quantity uses the MR row's UOM.
+        if submitting and proposed_stock > requested_stock - ordered_stock:
+            raise PurchaseOrderOutcomeError(
+                f"The order exceeds the remaining quantity for {line.item_id} on Material Request "
+                f"{line.requisition_id} (line {request_row.get('idx', line.line_number)})", rejected=True,
+            )
+        return float(factor)
+
     def create_purchase_order(self, data: PurchaseOrderCreate) -> PurchaseOrder:
+        if data.idempotency_key:
+            return self._create_keyed_purchase_order(data)
+
         from datetime import date, timedelta
         default_date = (date.today() + timedelta(days=14)).isoformat()
 
         # Build MR item name lookup if we have a requisition link
         # ERPNext needs material_request_item (row name) for proper MR→PO linkage
-        mr_item_map = {}  # item_code → MR item row name
+        mr_item_map: dict[str, str] = {}
         mr_ids = set(li.requisition_id for li in data.line_items if li.requisition_id)
         for mr_id in mr_ids:
             try:
@@ -284,7 +333,6 @@ class ERPNextAdapter(ERPAdapterBase):
             }
             if li.requisition_id:
                 item["material_request"] = li.requisition_id
-                # Add the MR item row name for proper ERPNext linkage
                 if li.item_id in mr_item_map:
                     item["material_request_item"] = mr_item_map[li.item_id]
             items.append(item)
@@ -328,6 +376,187 @@ class ERPNextAdapter(ERPAdapterBase):
                     logger.warning(f"Failed to update MR {mr_id} status: {e}")
             return self.get_purchase_order(doc["name"])
         raise ValueError("Failed to create purchase order in ERPNext")
+
+    def _approved_po_payload(self, data: PurchaseOrderCreate, *, submitting: bool = True) -> dict:
+        request_ids = {line.requisition_id for line in data.line_items}
+        if len(request_ids) != 1 or None in request_ids or "" in request_ids:
+            raise PurchaseOrderOutcomeError("A keyed order must link to one Material Request", rejected=True)
+        request_id = next(iter(request_ids))
+        try:
+            supplier = self.client.get("Supplier", data.supplier_id, timeout=_PO_REQUEST_TIMEOUT)
+            company = self.client.get("Company", DEFAULT_COMPANY, timeout=_PO_REQUEST_TIMEOUT)
+            request = self.client.get("Material Request", request_id, timeout=_PO_REQUEST_TIMEOUT)
+            canonical = self._map_requisition(request)
+        except Exception as exc:
+            raise PurchaseOrderOutcomeError("Could not verify the Material Request, supplier and currency in ERPNext") from exc
+        if (
+            request.get("name") != request_id
+            or request.get("company") != DEFAULT_COMPANY
+            or request_version(canonical.model_dump(mode="json")) != data.approved_request_version
+        ):
+            raise PurchaseOrderOutcomeError("The Material Request changed after approval", rejected=True)
+        if submitting and (request.get("docstatus") != 1 or request.get("status") in {"Ordered", "Stopped", "Cancelled"}):
+            raise PurchaseOrderOutcomeError("The Material Request is closed to new purchase orders", rejected=True)
+        if supplier.get("name") != data.supplier_id or supplier.get("disabled") or supplier.get("prevent_pos"):
+            raise PurchaseOrderOutcomeError("The approved supplier is not active for purchase orders", rejected=True)
+
+        currency = request.get("currency") or company.get("default_currency")
+        if not currency or data.currency != currency:
+            raise PurchaseOrderOutcomeError("The approved order currency does not match ERPNext", rejected=True)
+        terms = supplier.get("payment_terms") or ""
+        if data.payment_terms and data.payment_terms != terms:
+            raise PurchaseOrderOutcomeError("Use the ERPNext supplier's default payment terms", rejected=True)
+
+        items = []
+        request_rows = {row.get("idx"): row for row in request.get("items", [])}
+        seen = set()
+        for line in data.line_items:
+            row = request_rows.get(line.line_number, {})
+            if line.line_number in seen or row.get("item_code") != line.item_id or not row.get("name"):
+                raise PurchaseOrderOutcomeError("PO lines must match distinct reviewed Material Request rows", rejected=True)
+            seen.add(line.line_number)
+            warehouse = row.get("warehouse") or DEFAULT_WAREHOUSE
+            uom = row.get("uom") or "Nos"
+            schedule = row.get("schedule_date") or request.get("schedule_date")
+            if (
+                line.quantity != row.get("qty") or line.unit_price != row.get("rate") or line.unit_price <= 0
+                or line.unit_of_measure != uom or line.warehouse not in (None, warehouse)
+                or not schedule or line.delivery_date not in (None, schedule)
+            ):
+                raise PurchaseOrderOutcomeError("PO lines differ from the approved Material Request", rejected=True)
+            factor = self._check_keyed_po_quantity(line, row, submitting=submitting)
+            items.append({
+                "item_code": line.item_id, "qty": line.quantity, "rate": line.unit_price,
+                "material_request": request_id, "material_request_item": row["name"],
+                "warehouse": warehouse, "uom": uom, "conversion_factor": factor, "schedule_date": schedule,
+            })
+            if canonical.cost_center:
+                items[-1]["cost_center"] = canonical.cost_center
+
+        schedule = min(item["schedule_date"] for item in items)
+        if data.delivery_date and data.delivery_date != schedule:
+            raise PurchaseOrderOutcomeError("The PO delivery date differs from the approved Material Request", rejected=True)
+        payload = {
+            "supplier": data.supplier_id, "company": DEFAULT_COMPANY, "currency": currency,
+            "schedule_date": schedule, "items": items,
+            PO_IDEMPOTENCY_FIELD: data.idempotency_key,
+        }
+        if canonical.cost_center:
+            payload["cost_center"] = canonical.cost_center
+        if terms:
+            payload["payment_terms_template"] = terms
+        return payload
+
+    def _create_keyed_purchase_order(self, data: PurchaseOrderCreate) -> PurchaseOrder:
+        key = data.idempotency_key
+        existing = self._find_keyed_purchase_order(key)
+        if existing:
+            record = self._read_keyed_purchase_order(key, existing["name"])
+            if record["docstatus"] == 0 and not data.recover_draft:
+                raise PurchaseOrderOutcomeError("A keyed ERPNext draft exists and requires checked recovery")
+            return self._confirm_keyed_purchase_order(data, record)
+        if data.recover_draft:
+            raise PurchaseOrderOutcomeError("No matching ERPNext purchase order exists to recover")
+
+        payload = self._approved_po_payload(data)
+        transaction_date = date.today().isoformat()
+        if payload["schedule_date"] < transaction_date:
+            raise PurchaseOrderOutcomeError("Refresh and approve the past-due Material Request delivery date", rejected=True)
+        payload["transaction_date"] = transaction_date
+        try:
+            self.client.insert("Purchase Order", payload, retry=0, timeout=_PO_REQUEST_TIMEOUT, allow_redirects=False)
+        except Exception as exc:
+            logger.warning("Keyed PO insert needs reconciliation: %s", type(exc).__name__)
+        existing = self._find_keyed_purchase_order(key)
+        if not existing:
+            raise PurchaseOrderOutcomeError("ERPNext PO insert outcome could not be confirmed")
+        record = self._read_keyed_purchase_order(key, existing["name"])
+        return self._confirm_keyed_purchase_order(data, record)
+
+    def reconcile_purchase_order(self, idempotency_key: str) -> Optional[PurchaseOrder]:
+        existing = self._find_keyed_purchase_order(idempotency_key)
+        if not existing:
+            return None
+        record = self._read_keyed_purchase_order(idempotency_key, existing["name"])
+        order = self._map_purchase_order(record)
+        return order.model_copy(update={"status": OrderStatus.DRAFT}) if record["docstatus"] == 0 else order
+
+    def _find_keyed_purchase_order(self, key: str) -> Optional[dict]:
+        try:
+            records = self.client.get_list(
+                "Purchase Order",
+                fields=["name", "docstatus", "supplier", PO_IDEMPOTENCY_FIELD],
+                filters=[[PO_IDEMPOTENCY_FIELD, "=", key]],
+                limit=2,
+                timeout=_PO_REQUEST_TIMEOUT,
+                require_data=True,
+            )
+        except Exception as e:
+            raise PurchaseOrderOutcomeError("Could not look up the PO key in ERPNext") from e
+        if not records:
+            return None
+        if len(records) != 1 or records[0].get(PO_IDEMPOTENCY_FIELD) != key or not records[0].get("name"):
+            raise PurchaseOrderOutcomeError("ERPNext returned an invalid or ambiguous PO key match")
+        return records[0]
+
+    def _read_keyed_purchase_order(self, key: str, name: str) -> dict:
+        try:
+            record = self.client.get("Purchase Order", name, timeout=_PO_REQUEST_TIMEOUT)
+        except Exception as exc:
+            raise PurchaseOrderOutcomeError(f"Could not read keyed ERPNext PO {name}") from exc
+        if (
+            record.get("name") != name or record.get(PO_IDEMPOTENCY_FIELD) != key
+            or record.get("docstatus") not in (0, 1)
+        ):
+            raise PurchaseOrderOutcomeError(f"ERPNext PO {name} is not a matching draft or submitted order")
+        return record
+
+    @staticmethod
+    def _check_persisted_po(expected: dict, record: dict) -> None:
+        fields = ["supplier", "company", "currency", "payment_terms_template", "schedule_date"]
+        line_fields = ["material_request", "material_request_item", "item_code", "uom", "warehouse", "schedule_date"]
+        if expected.get("cost_center"):
+            fields.append("cost_center")
+            line_fields.append("cost_center")
+
+        def lines(data: dict) -> Counter:
+            return Counter(
+                tuple(line.get(field) for field in line_fields)
+                + tuple(Decimal(str(line.get(field))) for field in ("qty", "rate", "conversion_factor"))
+                for line in data.get("items", [])
+            )
+
+        try:
+            matches = all((expected.get(field) or "") == (record.get(field) or "") for field in fields)
+            if matches and lines(expected) == lines(record):
+                return
+        except (InvalidOperation, KeyError, TypeError, ValueError):
+            pass
+        raise PurchaseOrderOutcomeError("Persisted ERPNext order differs from the approved commercial payload", rejected=True)
+
+    def _confirm_keyed_purchase_order(self, data: PurchaseOrderCreate, record: dict) -> PurchaseOrder:
+        needs_submit = record["docstatus"] == 0
+        expected = self._approved_po_payload(data, submitting=needs_submit)
+        self._check_persisted_po(expected, record)
+        if not needs_submit:
+            return self._map_purchase_order(record)
+
+        name = record["name"]
+        if not record.get("modified"):
+            raise PurchaseOrderOutcomeError(f"ERPNext did not provide the saved draft version for {name}")
+        try:
+            self.client.submit(
+                "Purchase Order", name, timeout=_PO_REQUEST_TIMEOUT, allow_redirects=False,
+                expected_modified=record["modified"],
+            )
+        except Exception as exc:
+            # A lost response or a competing submit can leave the original PO submitted.
+            logger.warning("Keyed PO %s submit needs confirmation: %s", name, type(exc).__name__)
+        confirmed = self._read_keyed_purchase_order(data.idempotency_key, name)
+        if confirmed["docstatus"] != 1:
+            raise PurchaseOrderOutcomeError(f"ERPNext PO {name} submission could not be confirmed")
+        self._check_persisted_po(expected, confirmed)
+        return self._map_purchase_order(confirmed)
 
     def _update_mr_ordered_status(self, mr_id: str):
         """Update Material Request to reflect it has been ordered.
@@ -788,47 +1017,63 @@ class ERPNextAdapter(ERPAdapterBase):
     # --- Budgets ---
 
     def get_budget_status(self, cost_center: Optional[str] = None) -> BudgetStatusList:
-        from datetime import date
-        fiscal_year = str(date.today().year)
+        today = date.today()
+        fiscal_year, starts, ends = self.client.get_fiscal_year(
+            DEFAULT_COMPANY, today.isoformat(), timeout=_PO_REQUEST_TIMEOUT,
+        )
+        if not date.fromisoformat(starts) <= today <= date.fromisoformat(ends):
+            raise ValueError("ERPNext fiscal year does not cover the current date")
+        company = self.client.get("Company", DEFAULT_COMPANY, timeout=_PO_REQUEST_TIMEOUT)
+        currency = company.get("default_currency")
+        if company.get("name") != DEFAULT_COMPANY or not currency:
+            raise ValueError("ERPNext company currency is unavailable")
 
-        filters = [["fiscal_year", "=", fiscal_year], ["docstatus", "=", 1]]
+        filters = [
+            ["company", "=", DEFAULT_COMPANY], ["fiscal_year", "=", fiscal_year],
+            ["budget_against", "=", "Cost Center"], ["docstatus", "=", 1],
+        ]
         if cost_center:
-            filters.append(["cost_center", "like", f"%{cost_center}%"])
+            filters.append(["cost_center", "=", cost_center])
 
         budgets_raw = self.client.get_list(
-            "Budget",
-            fields=["name", "cost_center", "fiscal_year"],
-            filters=filters,
+            "Budget", fields=["name"], filters=filters,
+            timeout=_PO_REQUEST_TIMEOUT, require_data=True,
         )
 
         results = []
         for b in budgets_raw:
-            # Get budget detail with accounts (budget amounts)
-            try:
-                detail = self.client.get("Budget", b["name"])
-            except Exception:
-                continue  # nosec B112 -- skip budgets we can't fetch; surface the rest
-
-            budget_amount = 0.0
-            for acct in detail.get("accounts", []):
-                budget_amount += float(acct.get("budget_amount", 0) or 0)
-
-            cc = detail.get("cost_center", "")
+            detail = self.client.get("Budget", b["name"], timeout=_PO_REQUEST_TIMEOUT)
+            cc = detail.get("cost_center")
+            if (
+                detail.get("name") != b["name"] or detail.get("company") != DEFAULT_COMPANY
+                or detail.get("fiscal_year") != fiscal_year or detail.get("docstatus") != 1
+                or detail.get("budget_against") != "Cost Center" or not cc or (cost_center and cc != cost_center)
+                or not detail.get("accounts")
+            ):
+                raise ValueError("ERPNext returned incomplete or inconsistent budget details")
+            budget_amount = sum(Decimal(str(acct["budget_amount"])) for acct in detail["accounts"])
             cc_name = cc.split(" - ")[0] if " - " in cc else cc
 
-            # Get actual spend from submitted POs against this cost center
+            # Submitted PO commitments are compared in company currency for this fiscal year.
             pos = self.client.get_list(
                 "Purchase Order",
-                fields=["sum(grand_total) as total"],
+                fields=["sum(base_grand_total) as total"],
                 filters=[
-                    ["docstatus", "=", 1],
+                    ["company", "=", DEFAULT_COMPANY], ["docstatus", "=", 1],
                     ["cost_center", "=", cc],
+                    ["transaction_date", "between", [starts, ends]],
                 ],
+                timeout=_PO_REQUEST_TIMEOUT, require_data=True,
             )
-            actual_spend = float(pos[0].get("total", 0) or 0) if pos else 0.0
+            if len(pos) != 1 or "total" not in pos[0]:
+                raise ValueError("ERPNext did not provide the total PO commitments")
+            total = pos[0]["total"]
+            actual_spend = Decimal(str(total)) if total is not None else Decimal(0)
+            if not budget_amount.is_finite() or not actual_spend.is_finite() or actual_spend < 0:
+                raise ValueError("ERPNext returned invalid budget amounts")
 
             remaining = budget_amount - actual_spend
-            utilization = round((actual_spend / budget_amount) * 100, 1) if budget_amount > 0 else 0.0
+            utilization = round((actual_spend / budget_amount) * 100, 1) if budget_amount > 0 else 0
 
             results.append(BudgetStatus(
                 cost_center=cc,
@@ -839,6 +1084,7 @@ class ERPNextAdapter(ERPAdapterBase):
                 remaining=remaining,
                 utilization_pct=utilization,
                 exceeded=remaining < 0,
+                currency=currency,
             ))
 
         return BudgetStatusList(budgets=results, total_count=len(results))

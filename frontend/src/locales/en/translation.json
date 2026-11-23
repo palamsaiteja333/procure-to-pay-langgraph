@@ -161,20 +161,19 @@
   },
   "errors": {
     "ui": {
-      "bySeverity": "By Severity",
-      "colAgent": "Agent",
-      "colCategory": "Category",
       "colDocument": "Document",
       "colMessage": "Message",
-      "colRetryable": "Retryable",
-      "colSeverity": "Severity",
-      "colTime": "Time",
-      "errorLog": "Error Log ({{count}})",
-      "humanActionNeeded": "Human Action Needed",
-      "noErrors": "No errors -- agents are running clean",
-      "subtitle": "Agent failures and exceptions",
-      "title": "Agent Errors",
-      "unresolvedErrors": "Unresolved Errors"
+      "colStatus": "Status",
+      "colTime": "Last updated",
+      "errorLog": "Affected documents",
+      "failed": "Failed",
+      "humanActionNeeded": "Purchase orders needing review",
+      "loadFailed": "Could not load workflow issues. Reload to try again.",
+      "noErrors": "No failed workflows or purchase orders needing review.",
+      "poReview": "PO needs review",
+      "subtitle": "Failed workflows and purchase orders needing review",
+      "title": "Workflow Issues",
+      "unresolvedErrors": "Open workflow issues"
     }
   },
   "goodsReceipts": {

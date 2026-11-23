@@ -1,0 +1,105 @@
+{
+  "version": 1,
+  "cases": [
+    {
+      "id": "low-risk-standard", "description": "Routine stock order with confirmed budget.",
+      "erp": {"total_amount": 110, "budget": "PASS", "lines": [{"item_id": "BEARING-6204", "quantity": 2, "unit_price": 55}]},
+      "replay": {"sourcing": {"recommended_vendor": {"supplier_id": "SUP-BEARING"}}, "requisition": {"total_amount": 110, "risk_level": "LOW", "recommendation": "APPROVE", "findings": [{"check": "Budget", "status": "PASS"}]}},
+      "expected": {"status": "COMPLETE", "decision": "AI_APPROVED", "purchase_orders": 1, "suppliers": ["SUP-BEARING"], "recommended_supplier": "SUP-BEARING", "required_findings": [["Budget", "PASS"]]}
+    },
+    {
+      "id": "threshold-inclusive", "description": "Medium risk at the exact automatic approval limit.",
+      "erp": {"total_amount": 5000, "budget": "PASS", "lines": [{"item_id": "PUMP-03", "quantity": 2, "unit_price": 2500}]},
+      "replay": {"sourcing": {"recommended_vendor": {"supplier_id": "SUP-PUMP"}}, "requisition": {"total_amount": 5000, "risk_level": "MEDIUM", "recommendation": "APPROVE", "findings": [{"check": "Budget", "status": "PASS"}]}},
+      "expected": {"status": "COMPLETE", "decision": "AI_APPROVED", "purchase_orders": 1, "suppliers": ["SUP-PUMP"]}
+    },
+    {
+      "id": "over-threshold", "description": "Low-risk order exceeds the automatic approval limit by one dollar.",
+      "erp": {"total_amount": 5001, "budget": "PASS", "lines": [{"item_id": "PUMP-04", "quantity": 1, "unit_price": 5001}]},
+      "replay": {"sourcing": {"recommended_vendor": {"supplier_id": "SUP-PUMP"}}, "requisition": {"total_amount": 5001, "risk_level": "LOW", "recommendation": "APPROVE", "findings": [{"check": "Budget", "status": "PASS"}]}},
+      "expected": {"status": "PENDING_APPROVAL", "decision": "AI_ESCALATED", "purchase_orders": 0, "suppliers": []}
+    },
+    {
+      "id": "new-high-risk-supplier", "description": "Small purchase from a supplier flagged high risk.",
+      "erp": {"total_amount": 720, "budget": "PASS", "lines": [{"item_id": "MOTOR-12V", "quantity": 4, "unit_price": 180}]},
+      "replay": {"sourcing": {"recommended_vendor": {"supplier_id": "SUP-NEW"}}, "requisition": {"total_amount": 720, "risk_level": "HIGH", "recommendation": "APPROVE", "findings": [{"check": "Supplier Risk", "status": "FAIL"}, {"check": "Budget", "status": "PASS"}]}},
+      "expected": {"status": "PENDING_APPROVAL", "decision": "AI_ESCALATED", "purchase_orders": 0, "suppliers": []}
+    },
+    {
+      "id": "budget-fail-reported", "description": "Agent reports an over-budget result but recommends approval.",
+      "erp": {"total_amount": 600, "budget": "FAIL", "lines": [{"item_id": "SAFETY-BOOTS", "quantity": 6, "unit_price": 100}]},
+      "replay": {"sourcing": {"recommended_vendor": {"supplier_id": "SUP-SAFETY"}}, "requisition": {"total_amount": 600, "risk_level": "LOW", "recommendation": "APPROVE", "findings": [{"check": "Budget", "status": "FAIL"}]}},
+      "expected": {"status": "PENDING_APPROVAL", "decision": "AI_ESCALATED", "purchase_orders": 0, "suppliers": [], "required_findings": [["Budget", "FAIL"]]}
+    },
+    {
+      "id": "duplicate-request", "description": "Agent identifies a duplicate requisition for already-requested materials.",
+      "erp": {"total_amount": 250, "budget": "PASS", "lines": [{"item_id": "GLASS-10", "quantity": 5, "unit_price": 50}]},
+      "replay": {"sourcing": {"recommended_vendor": {"supplier_id": "SUP-SAFETY"}}, "requisition": {"total_amount": 250, "risk_level": "HIGH", "recommendation": "REJECT", "findings": [{"check": "Duplicate", "status": "FAIL"}, {"check": "Budget", "status": "PASS"}]}},
+      "expected": {"status": "REJECTED", "decision": "AI_REJECTED", "purchase_orders": 0, "suppliers": [], "required_findings": [["Duplicate", "FAIL"]]}
+    },
+    {
+      "id": "catalog-item-unverified", "description": "The requisition contains a noncatalog item and must be rejected.",
+      "erp": {"total_amount": 100, "budget": "PASS", "lines": [{"item_id": "NONCATALOG-1", "quantity": 1, "unit_price": 100}]},
+      "replay": {"sourcing": {"recommended_vendor": {"supplier_id": "SUP-SAFETY"}}, "requisition": {"total_amount": 100, "risk_level": "HIGH", "recommendation": "REJECT", "findings": [{"check": "Item Validation", "status": "FAIL"}]}},
+      "expected": {"status": "REJECTED", "decision": "AI_REJECTED", "purchase_orders": 0, "suppliers": []}
+    },
+    {
+      "id": "no-suitable-vendor", "description": "Sourcing cannot identify a supplier for a discontinued part.",
+      "erp": {"total_amount": 450, "budget": "PASS", "lines": [{"item_id": "RELAY-EOL", "quantity": 3, "unit_price": 150}]},
+      "replay": {"sourcing": {"recommended_vendor": {}, "reasoning": "No suitable supplier."}},
+      "expected": {"status": "FAILED", "decision": "", "purchase_orders": 0, "suppliers": [], "error_code": "NO_VENDOR"}
+    },
+    {
+      "id": "already-ordered", "description": "ERP confirms an earlier order, so workflow should stop before the agents run.",
+      "erp": {"status": "ordered", "total_amount": 640, "budget": "PASS", "lines": [{"item_id": "ROPE-20", "quantity": 8, "unit_price": 80}]},
+      "replay": {},
+      "expected": {"status": "FAILED", "decision": "", "purchase_orders": 0, "suppliers": [], "error_code": "REQUISITION_CLOSED"}
+    },
+    {
+      "id": "human-approved-split", "description": "Approver accepts a split award and each supplier receives only its allocation.",
+      "erp": {"total_amount": 7200, "budget": "PASS", "lines": [{"item_id": "VALVE-A", "quantity": 2, "unit_price": 2500}, {"item_id": "FILTER-B", "quantity": 2, "unit_price": 1100}]},
+      "replay": {"sourcing": {"recommended_vendor": {"supplier_id": "SUP-VALVE"}, "split_award": [{"supplier_id": "SUP-VALVE", "items": ["VALVE-A"]}, {"supplier_id": "SUP-FILTER", "items": ["FILTER-B"]}]}, "requisition": {"total_amount": 7200, "risk_level": "MEDIUM", "recommendation": "APPROVE", "findings": [{"check": "Budget", "status": "PASS"}]}},
+      "human_action": "APPROVE",
+      "expected": {"status": "COMPLETE", "decision": "HUMAN_APPROVED", "purchase_orders": 2, "suppliers": ["SUP-FILTER", "SUP-VALVE"], "allocations": {"SUP-FILTER": {"FILTER-B": 2}, "SUP-VALVE": {"VALVE-A": 2}}, "initial_status": "PENDING_APPROVAL"}
+    },
+    {
+      "id": "human-rejected", "description": "Approver rejects a high-risk expedited purchase.",
+      "erp": {"total_amount": 7200, "budget": "PASS", "lines": [{"item_id": "PUMP-RUSH", "quantity": 2, "unit_price": 3600}]},
+      "replay": {"sourcing": {"recommended_vendor": {"supplier_id": "SUP-PUMP"}}, "requisition": {"total_amount": 7200, "risk_level": "HIGH", "recommendation": "ESCALATE", "findings": [{"check": "Budget", "status": "PASS"}]}},
+      "human_action": "REJECT",
+      "expected": {"status": "REJECTED", "decision": "HUMAN_REJECTED", "purchase_orders": 0, "suppliers": [], "initial_status": "PENDING_APPROVAL"}
+    },
+    {
+      "id": "changed-after-approval", "description": "Quantity and total change in ERP after approval.",
+      "erp": {"total_amount": 8000, "budget": "PASS", "lines": [{"item_id": "LIFT-MOTOR", "quantity": 2, "unit_price": 4000}]},
+      "replay": {"sourcing": {"recommended_vendor": {"supplier_id": "SUP-LIFT"}}, "requisition": {"total_amount": 8000, "risk_level": "MEDIUM", "recommendation": "APPROVE", "findings": [{"check": "Budget", "status": "PASS"}]}},
+      "human_action": "APPROVE", "after_decision": {"total_amount": 12000, "lines": [{"item_id": "LIFT-MOTOR", "quantity": 3, "unit_price": 4000}]},
+      "expected": {"status": "FAILED", "decision": "HUMAN_APPROVED", "purchase_orders": 0, "suppliers": [], "initial_status": "PENDING_APPROVAL", "error_code": "STALE_APPROVAL"}
+    },
+    {
+      "id": "lost-response-after-commit", "description": "The ERP committed a single-supplier PO and its response was lost.",
+      "erp": {"total_amount": 6200, "budget": "PASS", "lines": [{"item_id": "GASKET", "quantity": 20, "unit_price": 310}]},
+      "replay": {"sourcing": {"recommended_vendor": {"supplier_id": "SUP-GASKET"}}, "requisition": {"total_amount": 6200, "risk_level": "MEDIUM", "recommendation": "APPROVE", "findings": [{"check": "Budget", "status": "PASS"}]}},
+      "human_action": "APPROVE", "lose_po_response": true, "repeat_resume": true,
+      "expected": {"status": "COMPLETE", "decision": "HUMAN_APPROVED", "purchase_orders": 1, "suppliers": ["SUP-GASKET"], "allocations": {"SUP-GASKET": {"GASKET": 20}}, "initial_status": "PENDING_APPROVAL"}
+    },
+    {
+      "id": "underreported-amount", "description": "ERP total exceeds policy but model reports only part of the requisition.",
+      "erp": {"total_amount": 6500, "budget": "PASS", "lines": [{"item_id": "MOTOR-X", "quantity": 2, "unit_price": 3250}]},
+      "replay": {"sourcing": {"recommended_vendor": {"supplier_id": "SUP-MOTOR"}}, "requisition": {"total_amount": 3250, "risk_level": "LOW", "recommendation": "APPROVE", "findings": [{"check": "Budget", "status": "PASS"}]}},
+      "expected": {"status": "PENDING_APPROVAL", "decision": "AI_ESCALATED", "purchase_orders": 0, "suppliers": []}
+    },
+    {
+      "id": "budget-evidence-missing", "description": "The budget source is unavailable and the agent reports no budget finding.",
+      "erp": {"total_amount": 440, "budget": "UNAVAILABLE", "lines": [{"item_id": "GLOVES-XL", "quantity": 22, "unit_price": 20}]},
+      "replay": {"sourcing": {"recommended_vendor": {"supplier_id": "SUP-SAFETY"}}, "requisition": {"total_amount": 440, "risk_level": "LOW", "recommendation": "APPROVE", "findings": [{"check": "Catalog", "status": "PASS"}]}},
+      "expected": {"status": "PENDING_APPROVAL", "decision": "AI_ESCALATED", "purchase_orders": 0, "suppliers": []}
+    },
+    {
+      "id": "budget-fail-misreported", "description": "Budget source reports FAIL while the agent reports PASS.",
+      "erp": {"total_amount": 900, "budget": "FAIL", "lines": [{"item_id": "FUSE-HV", "quantity": 30, "unit_price": 30}]},
+      "replay": {"sourcing": {"recommended_vendor": {"supplier_id": "SUP-ELECTRIC"}}, "requisition": {"total_amount": 900, "risk_level": "LOW", "recommendation": "APPROVE", "findings": [{"check": "Budget", "status": "PASS"}]}},
+      "expected": {"status": "PENDING_APPROVAL", "decision": "AI_ESCALATED", "purchase_orders": 0, "suppliers": []}
+    }
+  ]
+}

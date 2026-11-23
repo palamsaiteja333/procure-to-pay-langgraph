@@ -109,9 +109,10 @@ class ProgressBridge:
     async def run(self, agent_obj, prompt: str):
         """Async generator: yields JSON progress lines, stores result in self.result."""
         async def _execute():
-            r = await asyncio.to_thread(agent_obj, prompt)
-            self._queue.put_nowait(_SENTINEL)
-            return r
+            try:
+                return await asyncio.to_thread(agent_obj, prompt)
+            finally:
+                self._queue.put_nowait(_SENTINEL)
 
         task = asyncio.create_task(_execute())
 

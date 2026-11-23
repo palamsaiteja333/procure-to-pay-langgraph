@@ -64,6 +64,10 @@ class ERPAdapterBase(ABC):
     @abstractmethod
     def create_purchase_order(self, data: PurchaseOrderCreate) -> PurchaseOrder: ...
 
+    def reconcile_purchase_order(self, idempotency_key: str) -> Optional[PurchaseOrder]:
+        """Read the existing draft or submitted PO for this key."""
+        raise NotImplementedError("Purchase order reconciliation not supported by this adapter")
+
     # --- Receipts ---
     @abstractmethod
     def list_receipts(self, order_id: Optional[str] = None) -> ReceiptList: ...

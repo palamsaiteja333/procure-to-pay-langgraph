@@ -70,6 +70,9 @@ class ERPNextClient:
         order_by: Optional[str] = None,
         group_by: Optional[str] = None,
         limit: int = 0,
+        *,
+        timeout: Optional[tuple[float, float]] = None,
+        require_data: bool = False,
     ) -> list[dict]:
         """List documents of a given doctype."""
         params: dict[str, Any] = {"limit_page_length": limit}
@@ -84,20 +87,24 @@ class ERPNextClient:
         if group_by:
             params["group_by"] = group_by
         resp = self.session.get(
-            f"{self.base_url}/api/resource/{doctype}", params=params
+            f"{self.base_url}/api/resource/{doctype}", params=params, timeout=timeout
         )
         resp.raise_for_status()
-        return resp.json().get("data", [])
+        payload = resp.json()
+        if require_data and not isinstance(payload.get("data"), list):
+            raise ValueError(f"Invalid {doctype} list response from ERPNext")
+        return payload.get("data", [])
 
-    def get(self, doctype: str, name: str) -> dict:
+    def get(self, doctype: str, name: str, *, timeout: Optional[tuple[float, float]] = None) -> dict:
         """Get a single document by name."""
         resp = self.session.get(
-            f"{self.base_url}/api/resource/{doctype}/{name}"
+            f"{self.base_url}/api/resource/{doctype}/{name}", timeout=timeout
         )
         resp.raise_for_status()
         return resp.json().get("data", {})
 
-    def insert(self, doctype: str, data: dict, retry: int = 2) -> dict:
+    def insert(self, doctype: str, data: dict, retry: int = 2, *,
+               timeout: Optional[tuple[float, float]] = None, allow_redirects: bool = True) -> dict:
         """Insert a new document. Returns created document or empty dict on conflict."""
         data["doctype"] = doctype
         for attempt in range(retry + 1):
@@ -105,6 +112,8 @@ class ERPNextClient:
                 resp = self.session.post(
                     f"{self.base_url}/api/resource/{doctype}",
                     json={"data": json.dumps(data)},
+                    timeout=timeout,
+                    allow_redirects=allow_redirects,
                 )
                 if resp.status_code in (409, 417):
                     text = resp.text.lower()
@@ -120,11 +129,18 @@ class ERPNextClient:
                     continue
                 raise
 
-    def submit(self, doctype: str, name: str) -> dict:
+    def submit(self, doctype: str, name: str, *, timeout: Optional[tuple[float, float]] = None,
+               allow_redirects: bool = True, expected_modified: Optional[str] = None) -> dict:
         """Submit (finalize) a document."""
+        values: dict[str, int | str] = {"docstatus": 1}
+        if expected_modified:
+            # Frappe compares the supplied modified value with the saved document under its update lock.
+            values["modified"] = expected_modified
         resp = self.session.put(
             f"{self.base_url}/api/resource/{doctype}/{name}",
-            json={"data": json.dumps({"docstatus": 1})},
+            json={"data": json.dumps(values)},
+            timeout=timeout,
+            allow_redirects=allow_redirects,
         )
         resp.raise_for_status()
         return resp.json().get("data", {})
@@ -140,6 +156,18 @@ class ERPNextClient:
         )
         resp.raise_for_status()
         return int(resp.json().get("message", 0))
+
+    def get_fiscal_year(self, company: str, on_date: str, *, timeout: tuple[float, float]) -> tuple[str, str, str]:
+        """Resolve the company's configured fiscal year for a transaction date."""
+        resp = self.session.get(
+            f"{self.base_url}/api/method/erpnext.accounts.utils.get_fiscal_year",
+            params={"date": on_date, "company": company}, timeout=timeout,
+        )
+        resp.raise_for_status()
+        year = resp.json().get("message")
+        if not isinstance(year, list) or len(year) != 3 or not all(isinstance(value, str) and value for value in year):
+            raise ValueError("ERPNext did not provide fiscal-year dates")
+        return year[0], year[1], year[2]
 
     def get_report(self, report_name: str, filters: Optional[dict] = None) -> dict:
         """Run an ERPNext report."""

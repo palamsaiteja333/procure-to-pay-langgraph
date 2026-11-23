@@ -15,15 +15,17 @@ from dataclasses import dataclass
 from typing import Optional
 
 from fastapi import (
-    Depends, FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile,
+    Depends, FastAPI, File, Form, Header, HTTPException, Query, Request, Response, UploadFile,
 )
 from mangum import Mangum
+from pydantic import ValidationError
 
 from adapters.models import (
     Supplier, SupplierList,
     Item, ItemList,
     Requisition, RequisitionCreate, RequisitionList,
-    PurchaseOrder, PurchaseOrderCreate, PurchaseOrderList,
+    OrderStatus, PurchaseOrder, PurchaseOrderCreate, PurchaseOrderList,
+    PurchaseOrderFailure, PurchaseOrderReconcile,
     Receipt, ReceiptCreate, ReceiptList,
     Invoice, InvoiceCreate, InvoiceList,
     Payment, PaymentCreate, PaymentList,
@@ -31,6 +33,7 @@ from adapters.models import (
     InvoiceExtractionRequest, InvoiceExtractionResult,
 )
 from adapters.erp_adapter_base import ERPAdapterBase
+from adapters.errors import PurchaseOrderOutcomeError
 
 logger = logging.getLogger("p2p.canonical_api")
 
@@ -169,6 +172,15 @@ def _caller(
     return Caller(email=email, allow_service_account=False)
 
 
+def _workflow_caller(
+    caller: Caller = Depends(_caller),
+    user_email: Optional[str] = Query(None, description="ERP identity supplied by the internal workflow."),
+) -> Caller:
+    if user_email and caller.allow_service_account:
+        return Caller(email=user_email, allow_service_account=True)
+    return caller
+
+
 def _build_service_adapter() -> ERPAdapterBase:
     """Build (once) the shared full-access service-account adapter."""
     global _service_adapter
@@ -266,7 +278,7 @@ def list_suppliers(
 @app.get("/suppliers/{supplier_id}", response_model=Supplier,
          summary="Get supplier details",
          operation_id="get_supplier")
-def get_supplier(supplier_id: str, caller: Caller = Depends(_caller)):
+def get_supplier(supplier_id: str, caller: Caller = Depends(_workflow_caller)):
     """Get detailed information for a specific supplier by ID."""
     try:
         return _get_adapter(caller).get_supplier(supplier_id)
@@ -317,7 +329,7 @@ def list_requisitions(
 @app.get("/requisitions/{requisition_id}", response_model=Requisition,
          summary="Get requisition details with line items",
          operation_id="get_requisition")
-def get_requisition(requisition_id: str, caller: Caller = Depends(_caller)):
+def get_requisition(requisition_id: str, caller: Caller = Depends(_workflow_caller)):
     """Get a purchase requisition with all line items by ID."""
     try:
         return _get_adapter(caller).get_requisition(requisition_id)
@@ -390,12 +402,66 @@ def get_purchase_order(order_id: str, caller: Caller = Depends(_caller)):
         raise HTTPException(status_code=404, detail=f"Purchase order not found: {order_id}")
 
 
-@app.post("/purchase-orders", response_model=PurchaseOrder, status_code=201,
+def _purchase_order_failure(exc: Exception, *, allow_rejected: bool = True) -> PurchaseOrderFailure:
+    rejected = allow_rejected and (
+        isinstance(exc, ValidationError) or (isinstance(exc, PurchaseOrderOutcomeError) and exc.rejected)
+    )
+    if isinstance(exc, PurchaseOrderOutcomeError):
+        message = str(exc)
+    elif isinstance(exc, ValidationError):
+        message = "Invalid keyed purchase order input"
+    else:
+        message = "Could not determine the purchase order outcome in ERPNext"
+    return PurchaseOrderFailure(
+        status="rejected" if rejected else "unknown",
+        error_code="PO_REJECTED" if rejected else "PO_OUTCOME_UNKNOWN",
+        error=message,
+    )
+
+
+@app.post("/purchase-orders", response_model=PurchaseOrder | PurchaseOrderFailure, status_code=201,
           summary="Create a new purchase order",
           operation_id="create_purchase_order")
-def create_purchase_order(data: PurchaseOrderCreate, caller: Caller = Depends(_caller)):
+def create_purchase_order(data: PurchaseOrderCreate, response: Response, caller: Caller = Depends(_workflow_caller)):
     """Create and submit a new purchase order."""
-    return _get_adapter(caller).create_purchase_order(data)
+    if data.idempotency_key and not caller.allow_service_account:
+        raise HTTPException(status_code=403, detail="Keyed purchase order creation is an internal operation")
+    if data.idempotency_key and caller.email:
+        caller = Caller(email=caller.email)
+    try:
+        return _get_adapter(caller).create_purchase_order(data)
+    except Exception as exc:
+        if not data.idempotency_key:
+            raise
+        logger.warning("Keyed PO create failed: %s", type(exc).__name__)
+        # The local MCP shim must receive the outcome even when no PO was created.
+        response.status_code = 200
+        return _purchase_order_failure(exc)
+
+
+def _reconcile_purchase_order(data: PurchaseOrderReconcile, adapter: ERPAdapterBase) -> dict:
+    order = adapter.reconcile_purchase_order(data.idempotency_key)
+    if order is None:
+        return {"status": "missing"}
+    return {
+        "status": "draft" if order.status == OrderStatus.DRAFT else "submitted",
+        "purchase_order": order.model_dump(mode="json"),
+    }
+
+
+@app.post("/purchase-orders/reconcile", operation_id="reconcile_purchase_order",
+          summary="Reconcile a keyed purchase order")
+def reconcile_purchase_order(data: PurchaseOrderReconcile, caller: Caller = Depends(_workflow_caller)) -> dict:
+    """Read the existing draft or submitted purchase order for this key."""
+    if not caller.allow_service_account:
+        raise HTTPException(status_code=403, detail="Purchase order reconciliation is an internal operation")
+    if caller.email:
+        caller = Caller(email=caller.email)
+    try:
+        return _reconcile_purchase_order(data, _get_adapter(caller))
+    except Exception as exc:
+        logger.warning("PO reconciliation failed: %s", type(exc).__name__)
+        return _purchase_order_failure(exc, allow_rejected=False).model_dump()
 
 
 # --- Receipts ---
@@ -527,9 +593,12 @@ def get_supplier_performance(caller: Caller = Depends(_caller)):
          operation_id="get_budget_status")
 def get_budget_status(
     cost_center: Optional[str] = Query(None, description="Filter by cost center name"),
-    caller: Caller = Depends(_caller),
+    caller: Caller = Depends(_workflow_caller),
 ):
     """Get budget vs actual spend for cost centers. Shows budget amount, actual spend, remaining, and utilization percentage."""
+    if caller.allow_service_account:
+        # A workflow budget decision needs company-wide PO commitments, including rows hidden from an individual user.
+        return _build_service_adapter().get_budget_status(cost_center=cost_center)
     adapter = _get_adapter(caller)
     try:
         return adapter.get_budget_status(cost_center=cost_center)
@@ -598,6 +667,8 @@ def _dispatch_tool(tool_name: str, params: dict, adapter: ERPAdapterBase):
         "get_purchase_order":       lambda: adapter.get_purchase_order(params["order_id"]),
         "create_purchase_order":    lambda: adapter.create_purchase_order(
                                         PurchaseOrderCreate(**params)),
+        "reconcile_purchase_order": lambda: _reconcile_purchase_order(
+                                        PurchaseOrderReconcile(**params), adapter),
         "list_receipts":            lambda: adapter.list_receipts(
                                         order_id=params.get("order_id")),
         "get_receipt":              lambda: adapter.get_receipt(params["receipt_id"]),
@@ -642,17 +713,23 @@ def handler(event, context):
         if delimiter in tool_name:
             tool_name = tool_name[tool_name.index(delimiter) + len(delimiter):]
 
-        # Extract user_email from params for per-user ERP credential scoping.
-        # Agents inject user_email into tool call params via prompt instructions.
+        # Cedar controls which tool callers may supply an ERP user identity.
         user_email = event.pop("user_email", None)
 
         logger.info("Gateway tool call: %s, user: %s, params: %s", tool_name, user_email, list(event.keys()))
 
-        # The Gateway is an authenticated internal caller and agents may act on
-        # system-initiated work with no end user, so the service account stays
-        # available on this path.
-        adapter = _get_adapter(Caller(email=user_email, allow_service_account=True))
-
+        keyed_create = tool_name == "create_purchase_order" and event.get("idempotency_key") is not None
+        controlled_order = keyed_create or tool_name == "reconcile_purchase_order"
+        try:
+            if tool_name == "get_budget_status":
+                # Cedar restricts this company-wide accounting read to IAM callers.
+                adapter = _build_service_adapter()
+            else:
+                adapter = _get_adapter(Caller(email=user_email, allow_service_account=not (user_email and controlled_order)))
+        except Exception as exc:
+            if controlled_order:
+                return _purchase_order_failure(exc, allow_rejected=False).model_dump()
+            raise
         try:
             result = _dispatch_tool(tool_name, event, adapter)
             # Convert Pydantic models to dicts
@@ -663,6 +740,8 @@ def handler(event, context):
             return result
         except Exception as e:
             logger.error("Tool %s failed: %s", tool_name, e)
+            if keyed_create or tool_name == "reconcile_purchase_order":
+                return _purchase_order_failure(e, allow_rejected=keyed_create).model_dump()
             return {"error": str(e)}
 
     # Standard API Gateway HTTP event → Mangum/FastAPI

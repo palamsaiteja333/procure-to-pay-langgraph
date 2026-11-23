@@ -39,6 +39,7 @@ DATA_DIR = UTILITIES_DIR / "data"
 sys.path.insert(0, str(SCRIPT_DIR))
 
 from erpnext_client import ERPNextClient  # noqa: E402
+from workflow_po_schema import ensure_workflow_po_key  # noqa: E402
 
 # ── Company constants ────────────────────────────────────────────────────
 COMPANY = "Apex Manufacturing Group"
@@ -404,6 +405,7 @@ def main():
     # Phase 1: Master Data (admin)
     print("\n🔧 PHASE 1: Master Data")
     seed_custom_fields(admin)
+    ensure_workflow_po_key(admin)
     seed_item_groups(admin)
     seed_payment_terms(admin)
     seed_suppliers(admin)

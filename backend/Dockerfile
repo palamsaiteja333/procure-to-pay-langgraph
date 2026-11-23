@@ -30,7 +30,7 @@ COPY requirements.txt .
 # Install dependencies into the system site-packages so the non-root user can
 # import them. Application code itself is owned by the non-root user.
 # nosemgrep -- missing-pip-no-cache-dir: sample Dockerfile; image size is not a concern here
-RUN uv pip install --system --no-cache -r requirements.txt
+RUN uv pip install --system --no-cache -r requirements.txt 'aws-opentelemetry-distro>=0.24.0,<1'
 
 # Copy application code with non-root ownership.
 COPY --chown=app:app agentcore_app.py .
@@ -55,5 +55,5 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
   CMD python -c "import urllib.request,sys; urllib.request.urlopen('http://127.0.0.1:8080/ping', timeout=3); sys.exit(0)" \
       || exit 1
 
-# Run the AgentCore app.
-CMD ["python", "agentcore_app.py"]
+# Only the workflow runtime exports the new trace spans.
+CMD ["sh", "-c", "if [ \"$AGENT_NAME\" = workflow ]; then exec opentelemetry-instrument python agentcore_app.py; fi; exec python agentcore_app.py"]

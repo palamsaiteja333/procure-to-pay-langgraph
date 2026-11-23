@@ -52,6 +52,7 @@ ProbeScanExport-*.csv
 
 ### Local harness (injected into frontend at runtime)
 frontend/public/local-config.js
+local/.state/
 
 ### Playwright MCP session artifacts
 .playwright-mcp/

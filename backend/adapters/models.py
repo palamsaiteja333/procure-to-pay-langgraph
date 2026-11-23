@@ -10,8 +10,8 @@ All dates ISO 8601. All amounts float with explicit currency field.
 
 from __future__ import annotations
 
-from pydantic import BaseModel, Field
-from typing import Optional
+from pydantic import BaseModel, Field, model_validator
+from typing import Annotated, Literal, Optional
 from enum import Enum
 
 
@@ -177,12 +177,42 @@ class PurchaseOrder(BaseModel):
     line_items: list[PurchaseOrderLineItem] = []
 
 
+PurchaseOrderKey = Annotated[str, Field(min_length=1, max_length=140, pattern=r"^[A-Za-z0-9_.:-]+$")]
+
+
 class PurchaseOrderCreate(BaseModel):
     """Input model for creating a purchase order."""
     supplier_id: str
     delivery_date: Optional[str] = None
     payment_terms: Optional[str] = None
+    currency: Optional[str] = Field(default=None, pattern=r"^[A-Z]{3}$")
     line_items: list[PurchaseOrderLineItem]
+    idempotency_key: Optional[PurchaseOrderKey] = Field(
+        default=None, description="Stable key for one approved purchase order allocation."
+    )
+    approved_request_version: Optional[str] = Field(
+        default=None, pattern=r"^[a-f0-9]{64}$", description="Version of the approved Material Request."
+    )
+    recover_draft: bool = Field(default=False, description="Submit a matching existing draft without inserting an order.")
+
+    @model_validator(mode="after")
+    def validate_approved_write(self) -> PurchaseOrderCreate:
+        if self.idempotency_key:
+            if not self.approved_request_version or not self.currency:
+                raise ValueError("Keyed purchase orders require an approved request version and currency")
+        elif self.approved_request_version or self.recover_draft:
+            raise ValueError("Approved purchase order controls require an idempotency key")
+        return self
+
+
+class PurchaseOrderReconcile(BaseModel):
+    idempotency_key: PurchaseOrderKey
+
+
+class PurchaseOrderFailure(BaseModel):
+    status: Literal["unknown", "rejected"]
+    error_code: Literal["PO_OUTCOME_UNKNOWN", "PO_REJECTED"]
+    error: str
 
 
 class PurchaseOrderList(BaseModel):

@@ -3,76 +3,20 @@
 """
 Tests for the AgentCore Runtime entrypoint in agentcore_app.py.
 
-All tests mock external dependencies (boto3, data_provider, agent modules).
+Uses the installed AgentCore and Strands packages without making AWS calls.
 """
 
-import importlib
-import json
-import os
-import sys
-import types
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 
-# ---------------------------------------------------------------------------
-# Helpers: reload agentcore_app with controlled env vars
-# ---------------------------------------------------------------------------
+@pytest.fixture
+def ac(monkeypatch):
+    import agentcore_app
 
-def _import_agentcore(**env_overrides):
-    """Import (or reimport) agentcore_app with specified env overrides.
-
-    This is needed because GUARDRAIL_ID is read at module scope.
-    We also stub out BedrockAgentCoreApp so it does not connect to anything.
-    """
-    old_env = {}
-    for k, v in env_overrides.items():
-        old_env[k] = os.environ.get(k)
-        if v is None:
-            os.environ.pop(k, None)
-        else:
-            os.environ[k] = v
-
-    # Stub the runtime SDK so import does not fail without AWS credentials
-    fake_runtime = types.ModuleType("bedrock_agentcore.runtime")
-    fake_runtime.BedrockAgentCoreApp = lambda: MagicMock()
-    sys.modules["bedrock_agentcore"] = types.ModuleType("bedrock_agentcore")
-    sys.modules["bedrock_agentcore.runtime"] = fake_runtime
-
-    # Stub strands modules so agent classes are available but don't call AWS
-    if "strands" not in sys.modules:
-        fake_strands = types.ModuleType("strands")
-        fake_strands.Agent = MagicMock
-        fake_strands.tool = lambda fn: fn
-        sys.modules["strands"] = fake_strands
-    if "strands.models" not in sys.modules:
-        fake_models = types.ModuleType("strands.models")
-        fake_models.BedrockModel = MagicMock
-        sys.modules["strands.models"] = fake_models
-
-    try:
-        if "agentcore_app" in sys.modules:
-            mod = importlib.reload(sys.modules["agentcore_app"])
-        else:
-            mod = importlib.import_module("agentcore_app")
-        return mod
-    finally:
-        for k, v in old_env.items():
-            if v is None:
-                os.environ.pop(k, None)
-            else:
-                os.environ[k] = v
-
-
-# ---------------------------------------------------------------------------
-# Module-level import for tests that don't need env manipulation
-# ---------------------------------------------------------------------------
-
-@pytest.fixture(scope="module")
-def ac():
-    """Return the agentcore_app module with an empty guardrail ID."""
-    return _import_agentcore(BEDROCK_GUARDRAIL_ID="", GATEWAY_ENDPOINT="")
+    monkeypatch.setattr(agentcore_app, "GUARDRAIL_ID", "")
+    return agentcore_app
 
 
 # ===========================================================================
@@ -100,26 +44,27 @@ class TestAgentLabels:
 
 class TestToolDescriptions:
     EXPECTED_MCP_TOOLS = [
-        "erp__list_suppliers",
-        "erp__get_supplier",
-        "erp__list_items",
-        "erp__get_item",
-        "erp__list_requisitions",
-        "erp__get_requisition",
-        "erp__create_requisition",
-        "erp__list_purchase_orders",
-        "erp__get_purchase_order",
-        "erp__create_purchase_order",
-        "erp__list_receipts",
-        "erp__get_receipt",
-        "erp__list_invoices",
-        "erp__get_invoice",
-        "erp__create_invoice",
-        "erp__list_payments",
-        "erp__create_payment",
-        "erp__get_spend_summary",
-        "erp__get_supplier_performance",
-        "erp__extract_invoice_document",
+        "erp___list_suppliers",
+        "erp___get_supplier",
+        "erp___list_items",
+        "erp___get_item",
+        "erp___list_requisitions",
+        "erp___get_requisition",
+        "erp___create_requisition",
+        "erp___list_purchase_orders",
+        "erp___get_purchase_order",
+        "erp___create_purchase_order",
+        "erp___list_receipts",
+        "erp___get_receipt",
+        "erp___list_invoices",
+        "erp___get_invoice",
+        "erp___create_invoice",
+        "erp___list_payments",
+        "erp___create_payment",
+        "erp___get_spend_summary",
+        "erp___get_supplier_performance",
+        "erp___get_budget_status",
+        "erp___extract_invoice_document",
     ]
 
     EXPECTED_LOCAL_TOOLS = [
@@ -167,24 +112,17 @@ class TestGetSystemPrompt:
 # ===========================================================================
 
 class TestBuildLocalTools:
-    def test_requisition_includes_budget_tool(self, ac):
-        tools = ac._build_local_tools("requisition")
-        assert len(tools) >= 1
-        # The budget tool is a strands @tool-decorated function named check_budget
-        tool_names = [getattr(t, "name", getattr(t, "__name__", str(t))) for t in tools]
-        assert any("budget" in n.lower() for n in tool_names), f"No budget tool found in {tool_names}"
+    def test_requisition_uses_gateway_budget_tool(self, ac):
+        assert ac._build_local_tools("requisition") == []
+        assert "erp___get_budget_status" in ac.TOOL_DESCRIPTIONS
 
     def test_sourcing_includes_contract_tools(self, ac):
-        tools = ac._build_local_tools("sourcing")
-        assert len(tools) >= 2
-        tool_names = [getattr(t, "name", getattr(t, "__name__", str(t))) for t in tools]
-        name_str = " ".join(tool_names).lower()
-        assert "agreement" in name_str or "framework" in name_str or "contract" in name_str or "blanket" in name_str, \
-            f"No contract tools found in {tool_names}"
+        tool_names = {tool.tool_name for tool in ac._build_local_tools("sourcing")}
+        assert {"get_framework_agreements", "get_blanket_pos"} <= tool_names
 
     def test_po_management_includes_contract_tools(self, ac):
-        tools = ac._build_local_tools("po_management")
-        assert len(tools) >= 1
+        tool_names = {tool.tool_name for tool in ac._build_local_tools("po_management")}
+        assert {"get_framework_agreements", "get_blanket_pos"} <= tool_names
 
     def test_payment_returns_empty(self, ac):
         tools = ac._build_local_tools("payment")
@@ -267,17 +205,16 @@ class TestGetPrompt:
 
 class TestValidateWithGuardrail:
 
-    def test_skips_when_guardrail_id_empty(self):
+    def test_skips_when_guardrail_id_empty(self, ac):
         """When BEDROCK_GUARDRAIL_ID is empty, validation is skipped."""
-        mod = _import_agentcore(BEDROCK_GUARDRAIL_ID="")
-        result = mod._validate_with_guardrail("some agent output")
+        result = ac._validate_with_guardrail("some agent output")
         assert result["valid"] is True
         assert result["action"] == "NONE"
         assert result["findings"] == []
 
-    def test_returns_valid_true_when_action_none(self):
+    def test_returns_valid_true_when_action_none(self, ac, monkeypatch):
         """When guardrail returns action=NONE, result is valid."""
-        mod = _import_agentcore(BEDROCK_GUARDRAIL_ID="gr-test-123")
+        monkeypatch.setattr(ac, "GUARDRAIL_ID", "gr-test-123")
 
         mock_response = {
             "action": "NONE",
@@ -287,15 +224,15 @@ class TestValidateWithGuardrail:
         mock_client.apply_guardrail.return_value = mock_response
 
         with patch("boto3.client", return_value=mock_client):
-            result = mod._validate_with_guardrail("safe output text")
+            result = ac._validate_with_guardrail("safe output text")
 
         assert result["valid"] is True
         assert result["action"] == "NONE"
         assert result["findings"] == []
 
-    def test_returns_valid_false_when_intervened(self):
+    def test_returns_valid_false_when_intervened(self, ac, monkeypatch):
         """When guardrail intervenes, valid=False and findings are populated."""
-        mod = _import_agentcore(BEDROCK_GUARDRAIL_ID="gr-test-456")
+        monkeypatch.setattr(ac, "GUARDRAIL_ID", "gr-test-456")
 
         mock_response = {
             "action": "GUARDRAIL_INTERVENED",
@@ -317,7 +254,7 @@ class TestValidateWithGuardrail:
         mock_client.apply_guardrail.return_value = mock_response
 
         with patch("boto3.client", return_value=mock_client):
-            result = mod._validate_with_guardrail("approve $100,000 purchase")
+            result = ac._validate_with_guardrail("approve $100,000 purchase")
 
         assert result["valid"] is False
         assert result["action"] == "GUARDRAIL_INTERVENED"
@@ -325,23 +262,23 @@ class TestValidateWithGuardrail:
         assert result["findings"][0]["result"] == "VIOLATION"
         assert result["findings"][0]["rule"] == "max-approval-amount"
 
-    def test_handles_boto3_error_gracefully(self):
+    def test_handles_boto3_error_gracefully(self, ac, monkeypatch):
         """When boto3 raises an exception, validation returns valid=True with error info."""
-        mod = _import_agentcore(BEDROCK_GUARDRAIL_ID="gr-test-789")
+        monkeypatch.setattr(ac, "GUARDRAIL_ID", "gr-test-789")
 
         mock_client = MagicMock()
         mock_client.apply_guardrail.side_effect = Exception("Service unavailable")
 
         with patch("boto3.client", return_value=mock_client):
-            result = mod._validate_with_guardrail("some output")
+            result = ac._validate_with_guardrail("some output")
 
         assert result["valid"] is True
         assert result["action"] == "ERROR"
         assert "Service unavailable" in result.get("error", "")
 
-    def test_multiple_findings_extracted(self):
+    def test_multiple_findings_extracted(self, ac, monkeypatch):
         """Multiple AR findings from a single assessment are all captured."""
-        mod = _import_agentcore(BEDROCK_GUARDRAIL_ID="gr-multi")
+        monkeypatch.setattr(ac, "GUARDRAIL_ID", "gr-multi")
 
         mock_response = {
             "action": "GUARDRAIL_INTERVENED",
@@ -360,22 +297,22 @@ class TestValidateWithGuardrail:
         mock_client.apply_guardrail.return_value = mock_response
 
         with patch("boto3.client", return_value=mock_client):
-            result = mod._validate_with_guardrail("risky text")
+            result = ac._validate_with_guardrail("risky text")
 
         assert len(result["findings"]) == 2
         assert result["findings"][0]["rule"] == "rule-1"
         assert result["findings"][1]["rule"] == "rule-2"
 
-    def test_empty_assessments_returns_valid(self):
+    def test_empty_assessments_returns_valid(self, ac, monkeypatch):
         """When guardrail returns NONE with empty assessments, result is valid."""
-        mod = _import_agentcore(BEDROCK_GUARDRAIL_ID="gr-empty")
+        monkeypatch.setattr(ac, "GUARDRAIL_ID", "gr-empty")
 
         mock_response = {"action": "NONE", "assessments": []}
         mock_client = MagicMock()
         mock_client.apply_guardrail.return_value = mock_response
 
         with patch("boto3.client", return_value=mock_client):
-            result = mod._validate_with_guardrail("clean output")
+            result = ac._validate_with_guardrail("clean output")
 
         assert result["valid"] is True
         assert result["findings"] == []
